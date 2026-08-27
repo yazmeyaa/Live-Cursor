@@ -26,7 +26,14 @@ jobs:
         run: npm ci --legacy-peer-deps
 
       - name: Validate Release Version
-        run: test "${GITHUB_REF_NAME}" = "$(node -p "require('./manifest.json').version")"
+        run: |
+          manifest_version="$(node -p "require('./manifest.json').version")"
+          package_version="$(node -p "require('./package.json').version")"
+          echo "Tag: ${GITHUB_REF_NAME}"
+          echo "Manifest: ${manifest_version}"
+          echo "Package: ${package_version}"
+          test "${GITHUB_REF_NAME}" = "${manifest_version}"
+          test "${manifest_version}" = "${package_version}"
 
       - name: Check Types
         run: npm run typecheck

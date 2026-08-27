@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.1] - 2026-08-28
+
+### Fixed
+- Restored native CodeMirror focus detection so Obsidian table cells remain editable during collaboration.
+- Replaced mismatch-based conflict creation with three-way hash comparison.
+- Deduplicated conflict copies by content hash and migrated legacy synchronization state.
+- Aligned release metadata and validation across the Git tag, manifest, and npm package.
+
 ## [1.4.0] - 2026-08-27
 
 ### Changed

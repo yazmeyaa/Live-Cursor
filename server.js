@@ -625,7 +625,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log('===================================================');
   console.log('       LAPLAS COWORK PRIVATE SYNC SERVER             ');
   console.log('===================================================');
-  console.log(`[*] Version: 1.5.0`);
+  console.log(`[*] Version: 2.0.1`);
   console.log(`[*] Mode: Self-hosted`);
   console.log(`[*] Port: ${actualPort}`);
   console.log(`[*] Database Directory: ${dbDir}`);
