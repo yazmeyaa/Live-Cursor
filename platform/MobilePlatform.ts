@@ -10,7 +10,7 @@ export class MobilePlatform implements PlatformService {
   }
 
   async spawnDaemon(absolutePluginDir: string, envPath: string): Promise<any> {
-    console.warn('[LiveCursor] Spawning background server daemon is not supported on mobile.');
+    console.warn('[LaplasCowork] Spawning background server daemon is not supported on mobile.');
     return null;
   }
 

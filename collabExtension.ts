@@ -80,7 +80,7 @@ const collabTheme = EditorView.theme({
 });
 
 /**
- * Returns the full collaboration extension bundle for Live Cursor.
+ * Returns the full collaboration extension bundle for Laplas Cowork.
  *
  * Uses the battle-tested y-codemirror.next library for cursor/selection sync.
  * Cursor positions are stored as Y.RelativePosition (CRDT-safe), which means

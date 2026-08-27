@@ -23,14 +23,9 @@ function shouldIgnore(path: string): boolean {
     normalized.startsWith('.git/') || normalized === '.git' ||
     normalized.startsWith('.trash/') || normalized === '.trash' ||
     normalized.startsWith('node_modules/') || normalized === 'node_modules' ||
-    normalized.startsWith('.obsidian/plugins/live-cursor/') || normalized === '.obsidian/plugins/live-cursor' ||
+    normalized.startsWith('.obsidian/plugins/') || normalized === '.obsidian/plugins' ||
     normalized.startsWith('Sync Conflicts/') || normalized === 'Sync Conflicts'
   ) {
-    return true;
-  }
-
-  // Plugin internal data (room state binaries, backups, etc.)
-  if (normalized.includes('.obsidian/plugins/live-cursor/data/')) {
     return true;
   }
 
@@ -62,10 +57,11 @@ export class ConfigSyncEngine {
     private app: App,
     public serverUrl: string,
     private user: string,
-    private pass: string,
+    public pass: string,
     public workspace: string = 'default-workspace',
     private deviceName: string = 'Unknown Device',
-    private isLivePath: (path: string) => boolean = () => false
+    private isLivePath: (path: string) => boolean = () => false,
+    private dataDir: string = '.obsidian/plugins/laplas-cowork/data'
   ) {}
 
   private getQuery(relativePath?: string): string {
@@ -136,7 +132,7 @@ export class ConfigSyncEngine {
       const url = `${this.getApiUrl('/delete')}?${this.getQuery(relativePath)}`;
       await requestUrl({ url, method: 'DELETE' });
     } catch (e) {
-      console.warn(`[LiveCursor] Failed to delete remote file ${relativePath}:`, e);
+      console.warn(`[LaplasCowork] Failed to delete remote file ${relativePath}:`, e);
     }
   }
 
@@ -160,13 +156,13 @@ export class ConfigSyncEngine {
   private async loadSyncState() {
     if (this.syncStateLoaded) return;
     this.syncStateLoaded = true;
-    const statePath = '.obsidian/plugins/live-cursor/data/sync-state.json';
+    const statePath = `${this.dataDir}/sync-state.json`;
     try {
       if (await this.app.vault.adapter.exists(statePath)) {
         this.syncState = JSON.parse(await this.app.vault.adapter.read(statePath));
       }
     } catch (error) {
-      console.warn('[LiveCursor] Could not load sync state; rebuilding it from hashes.', error);
+      console.warn('[LaplasCowork] Could not load sync state; rebuilding it from hashes.', error);
       this.syncState = {};
     }
   }
@@ -185,9 +181,8 @@ export class ConfigSyncEngine {
 
   private async saveSyncState() {
     if (!this.syncStateDirty) return;
-    const dir = '.obsidian/plugins/live-cursor/data';
-    await this.app.vault.adapter.mkdir(dir).catch(() => {});
-    await this.app.vault.adapter.write(`${dir}/sync-state.json`, JSON.stringify(this.syncState));
+    await this.app.vault.adapter.mkdir(this.dataDir).catch(() => {});
+    await this.app.vault.adapter.write(`${this.dataDir}/sync-state.json`, JSON.stringify(this.syncState));
     this.syncStateDirty = false;
   }
 
@@ -373,14 +368,14 @@ export class ConfigSyncEngine {
 
       if (!silent) new Notice(actionsCount > 0 ? `Sync complete (${actionsCount} updated)` : 'Vault in sync.', 2000);
     } catch (e: any) {
-      console.error('[LiveCursor] Sync Error:', e);
+      console.error('[LaplasCowork] Sync Error:', e);
       if (!silent) {
         const errMsg = e.message || String(e);
         new Notice(`Sync failed: ${errMsg}`, 5000);
       }
     } finally {
       await this.saveSyncState().catch(error => {
-        console.error('[LiveCursor] Failed to save sync state:', error);
+        console.error('[LaplasCowork] Failed to save sync state:', error);
       });
       this.isSyncing = false;
       if (this.syncPending) {

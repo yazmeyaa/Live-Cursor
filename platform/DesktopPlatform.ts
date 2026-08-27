@@ -13,7 +13,7 @@ export class DesktopPlatform implements PlatformService {
     const cp = (window as any).require('child_process');
     const daemonScriptPath = `${absolutePluginDir}/server_daemon.js`;
     
-    console.log(`[LiveCursor] Spawning desktop server daemon at: ${daemonScriptPath}`);
+    console.log(`[LaplasCowork] Spawning desktop server daemon at: ${daemonScriptPath}`);
     
     const daemonProcess = cp.spawn('node', [daemonScriptPath], {
       env: {
@@ -28,7 +28,7 @@ export class DesktopPlatform implements PlatformService {
 
   killDaemon(process: any): void {
     if (process && typeof process.kill === 'function') {
-      console.log('[LiveCursor] Terminating background server daemon process...');
+      console.log('[LaplasCowork] Terminating background server daemon process...');
       process.kill();
     }
   }
@@ -49,7 +49,7 @@ export class DesktopPlatform implements PlatformService {
         }
       }
     } catch (e) {
-      console.error('[LiveCursor] Failed to retrieve network interfaces on desktop:', e);
+      console.error('[LaplasCowork] Failed to retrieve network interfaces on desktop:', e);
     }
     return localIps;
   }

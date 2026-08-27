@@ -1,10 +1,10 @@
 {
-  "id": "live-cursor",
-  "name": "Live-Cursor",
-  "version": "1.3.17",
+  "id": "laplas-cowork",
+  "name": "Laplas Cowork",
+  "version": "1.4.0",
   "minAppVersion": "1.4.0",
-  "description": "A free, open-source, privacy-first collaborative sync plugin.",
-  "author": "Live-Cursor",
-  "authorUrl": "https://github.com/Live-Cursor",
+  "description": "Self-hosted real-time collaboration and vault synchronization.",
+  "author": "yazmeyaa",
+  "authorUrl": "https://github.com/yazmeyaa",
   "isDesktopOnly": false
 }

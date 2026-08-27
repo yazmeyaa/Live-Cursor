@@ -1,8 +1,6 @@
 import esbuild from "esbuild";
 import process from "process";
-import { builtinModules, createRequire } from "module";
-
-const require = createRequire(import.meta.url);
+import path from "node:path";
 
 const banner =
 `/*
@@ -13,12 +11,41 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
+const embeddedServerPlugin = {
+	name: "embedded-sync-server",
+	setup(build) {
+		build.onResolve({ filter: /^\.\/server\.js\?embedded$/ }, args => ({
+			path: path.resolve(args.resolveDir, "server.js"),
+			namespace: "embedded-sync-server",
+		}));
+
+		build.onLoad({ filter: /.*/, namespace: "embedded-sync-server" }, async args => {
+			const result = await esbuild.build({
+				entryPoints: [args.path],
+				bundle: true,
+				platform: "node",
+				format: "cjs",
+				target: "node18",
+				write: false,
+				logLevel: "silent",
+			});
+			const source = result.outputFiles[0].text;
+			return {
+				contents: `export default ${JSON.stringify(source)};`,
+				loader: "js",
+				watchFiles: [args.path],
+			};
+		});
+	},
+};
+
 const clientContext = await esbuild.context({
 	banner: {
 		js: banner,
 	},
 	entryPoints: ["main.ts"],
 	bundle: true,
+	plugins: [embeddedServerPlugin],
 	external: [
 		"obsidian",
 		"electron",
@@ -65,21 +92,10 @@ const clientContext = await esbuild.context({
 	outfile: "main.js",
 });
 
-const serverContext = await esbuild.context({
-	entryPoints: ["server.js"],
-	bundle: true,
-	platform: "node",
-	format: "cjs",
-	target: "node18",
-	logLevel: "info",
-	sourcemap: prod ? false : "inline",
-	outfile: "server.bundle.js",
-});
-
 if (prod) {
-	await Promise.all([clientContext.rebuild(), serverContext.rebuild()]);
-	await Promise.all([clientContext.dispose(), serverContext.dispose()]);
+	await clientContext.rebuild();
+	await clientContext.dispose();
 	process.exit(0);
 } else {
-	await Promise.all([clientContext.watch(), serverContext.watch()]);
+	await clientContext.watch();
 }

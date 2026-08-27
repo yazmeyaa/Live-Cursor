@@ -9,6 +9,18 @@ const { setupWSConnection, docs: yWSdocs, getYDoc } = require('y-websocket/bin/u
 
 const port = process.env.PORT || 4444;
 const dbDir = process.env.DB_DIR || path.join(__dirname, 'data');
+const sharedSecret = process.env.LAPLAS_COWORK_SECRET || '';
+
+if (!sharedSecret) {
+  throw new Error('LAPLAS_COWORK_SECRET is required. Refusing to start an unauthenticated sync server.');
+}
+
+function isAuthorized(urlObj) {
+  const provided = urlObj.searchParams.get('pass') || '';
+  const expectedBuffer = Buffer.from(sharedSecret);
+  const providedBuffer = Buffer.from(provided);
+  return expectedBuffer.length === providedBuffer.length && crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+}
 
 // Create storage directories
 if (!fs.existsSync(dbDir)) {
@@ -229,7 +241,12 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  console.log(`[HTTP] ${req.method} ${req.url} - Request received`);
+  if (!isAuthorized(urlObj)) {
+    res.writeHead(401, { 'Content-Type': 'text/plain' });
+    return res.end('Unauthorized');
+  }
+
+  console.log(`[HTTP] ${req.method} ${pathname}`);
 
   // --- GET /api/manifest ---
   if (pathname === '/api/manifest' && req.method === 'GET') {
@@ -562,7 +579,7 @@ const server = http.createServer((req, res) => {
 
   console.log(`[HTTP] 200 OK / (default root status check page)`);
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Live Cursor Sync Server (WebSocket + DB) is running.');
+  res.end('Laplas Cowork Sync Server (WebSocket + DB) is running.');
 });
 
 // Create WebSocket server
@@ -586,6 +603,11 @@ wss.on('connection', (ws, req) => {
 
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  if (!isAuthorized(url)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   const workspace = url.searchParams.get('workspace') || 'default';
   const filePath = url.searchParams.get('path') || '';
   if (filePath && getWorkspaceTombstones(workspace)[filePath]) {
@@ -601,10 +623,10 @@ server.on('upgrade', (request, socket, head) => {
 server.listen(port, '0.0.0.0', () => {
   const actualPort = server.address().port;
   console.log('===================================================');
-  console.log('      LIVE CURSOR PRIVATE SYNC & DATABASE SERVER     ');
+  console.log('       LAPLAS COWORK PRIVATE SYNC SERVER             ');
   console.log('===================================================');
-  console.log(`[*] Version: 1.3.17`);
-  console.log(`[*] Mode: Production (Docker)`);
+  console.log(`[*] Version: 1.4.0`);
+  console.log(`[*] Mode: Self-hosted`);
   console.log(`[*] Port: ${actualPort}`);
   console.log(`[*] Database Directory: ${dbDir}`);
   console.log(`[*] Listening on: 0.0.0.0:${actualPort}`);

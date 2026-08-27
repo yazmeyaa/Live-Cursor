@@ -1,70 +1,85 @@
-# Live Cursor for Obsidian
+# Laplas Cowork
 
-Live Cursor provides real-time collaborative editing, collaborator cursors, and background vault synchronization for Obsidian through a single self-hosted sync server.
+Laplas Cowork adds real-time collaborative editing, collaborator cursors, and background vault synchronization to Obsidian through a self-hosted WebSocket/HTTP server.
 
----
-
-## Architecture & Connection Modes
-
-All clients connect to the same WebSocket/HTTP server and use the same room name. Markdown files use Yjs while they are open; closed notes and other vault files use hash-based background synchronization.
-
-### 1. Host Local (LAN/Tailscale) 
-**Best for:** Desktop users who want a quick, private sync session with other computers on their Wi-Fi or VPN.
-
-- **How it works:** When you click "Start Local Host" on a Desktop PC, Live Cursor starts the bundled sync daemon on port 4444. Other devices connect to it using the desktop's LAN or Tailscale address (for example, `ws://192.168.1.12:4444`).
-- **Simplicity:** No terminals, no Docker, no configuration files. One click and your PC is the server.
-- **Limitations:** Only works on Desktop OS (Windows, Mac, Linux). Mobile devices (iOS/Android) cannot act as the "Host" in this mode because mobile operating systems block background TCP port binding. Mobile devices **can** easily join this host, but they cannot *be* the host.
-
-### 2. Cloud Server
-**Best for:** Enterprise teams, 24/7 always-on sync environments, and heavy multi-user collaboration.
-
-- **How it works:** You deploy the background daemon (via Docker or Node) on a dedicated cloud VPS (like DigitalOcean, AWS, or a Raspberry Pi). You then point your Live Cursor settings to that `ws://` URL.
-- **Limitations:** Requires technical knowledge to deploy a cloud server, setup DNS, and manage SSL/TLS if you want secure web-socket (`wss://`) traffic.
-
----
+This repository is an independently maintained fork of the original Live Cursor project.
 
 ## Features
 
-- **Real-Time Cursor Tracking**: View the live cursors and text selections of other vault editors inside your notes with custom user profiles and dynamic hex colors.
-- **Background Vault Sync**: Content hashes detect real changes without relying on two-second timestamp windows.
-- **Safe Conflicts and Deletes**: Divergent markdown is preserved as a conflict copy, while deletion tombstones prevent unchanged files from reappearing.
+- Real-time collaborative editing and cursor presence for open Markdown notes.
+- Hash-based background synchronization for closed notes and other vault files.
+- Conflict copies when both local and remote content changed.
+- Deletion tombstones that prevent unchanged files from reappearing.
+- One-click local server on desktop; mobile devices can connect as clients.
+- Shared-secret authentication for every HTTP and WebSocket request.
 
----
+## Quick start
 
-## Submitting to the Obsidian Community Plugins Tab
+1. Install and enable the plugin on each device.
+2. On the desktop that will host synchronization, keep the default `ws://localhost:4444` URL and start the local server.
+3. Open the plugin settings and copy the room name and generated shared secret to every other device.
+4. On other devices, set the server URL to the host address, for example `ws://192.168.1.12:4444`.
+5. Open the same Markdown note on multiple devices.
 
-To make this plugin downloadable directly from the official Community Plugins catalog inside Obsidian, follow these steps:
+The desktop host must remain running. Mobile devices can join a server but cannot host one.
 
-### 1. Build and Release
-Compile the plugin code locally:
+## Security and privacy
+
+The plugin sends vault paths, file contents, modification metadata, the configured nickname, and live cursor presence to the server selected in settings. It does not include analytics or connect to a vendor-operated service.
+
+The desktop host starts a bundled Node.js child process, listens on `0.0.0.0:4444`, and stores its database under the plugin's `data` directory. The generated shared secret is stored in Obsidian plugin settings and is included in requests to the server.
+
+Use `wss://` through a trusted TLS reverse proxy when traffic crosses an untrusted network. The shared secret controls access, but vault contents are not end-to-end encrypted by this plugin. Anyone who obtains both the server address and shared secret can read or change synchronized data.
+
+The background synchronizer excludes `.git`, `.trash`, `node_modules`, installed plugin directories, device-specific workspace state, and its conflict directory. Review conflict copies before deleting them.
+
+## External server
+
+The bundled local server is sufficient for LAN or VPN use. For an always-on host, build the included Docker image and provide a strong secret at runtime:
+
 ```bash
+docker build -t laplas-cowork .
+docker run --rm -p 4444:4444 \
+  -e LAPLAS_COWORK_SECRET='replace-with-a-long-random-secret' \
+  -v laplas-cowork-data:/app/data \
+  laplas-cowork
+```
+
+Configure the same secret and server URL in every client. The server refuses to start without `LAPLAS_COWORK_SECRET`.
+
+## Development
+
+```bash
+npm ci --legacy-peer-deps
+npm run typecheck
+npm test
 npm run build
 ```
-This updates `main.js` and creates the standalone `server.bundle.js` background daemon.
 
-Create a new Release in your GitHub repository (`Live-Cursor/Live-Cursor`):
-- Name the release exactly matching your version in `manifest.json` (e.g. `1.0.0`).
-- Attach the following three compiled files as assets to the GitHub Release:
-  1. `main.js`
-  2. `server.bundle.js`
-  3. `manifest.json`
+The build embeds the desktop daemon in `main.js`. At runtime the desktop plugin extracts that bundled code into its own private data directory. A Community Plugins release therefore needs only:
 
-### 2. Submit to Obsidian Releases
-1. Fork the official [obsidianmd/obsidian-releases](https://github.com/obsidianmd/obsidian-releases) repository on GitHub.
-2. Edit `community-plugins.json` inside your fork and append your plugin configuration object at the end:
-   ```json
-   {
-     "id": "live-cursor",
-     "name": "Live Cursor",
-     "author": "Live-Cursor Organization",
-     "description": "Real-time collaborative editing and cursor tracking for Obsidian notes.",
-     "repo": "Live-Cursor/Live-Cursor"
-   }
-   ```
-3. Commit the change and submit a Pull Request to the `obsidian-releases` repository. The Obsidian development team will automatically review, verify compliance, and add it to the live catalog!
+- `main.js`
+- `manifest.json`
+- `styles.css`, if one is added later
 
----
+The release tag must exactly match the version in `manifest.json` without a leading `v`. The included GitHub Actions workflow builds and uploads the required assets.
+
+## Manual installation
+
+Create `<vault>/.obsidian/plugins/laplas-cowork/`, copy `main.js` and `manifest.json` into it, then enable **Laplas Cowork** in Obsidian. The repository's `install.sh` performs these steps for the local paths configured at the top of that script.
+
+## Attribution
+
+This project is a modified fork of [Live Cursor](https://github.com/Live-Cursor/Live-Cursor), originally developed by the Live-Cursor contributors.
+
+The original project and this fork are distributed under the MIT License. The original copyright and permission notice are preserved in [LICENSE](LICENSE).
+
+Copyright (c) 2026 Live-Cursor
+
+Copyright (c) 2026 yazmeyaa (modifications)
+
+This fork is independently maintained and is not endorsed by the original authors.
 
 ## License
 
-This project is licensed under the MIT License.
+MIT. See [LICENSE](LICENSE).

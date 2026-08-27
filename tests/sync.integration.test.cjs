@@ -29,13 +29,11 @@ const onceSynced = provider => new Promise((resolve, reject) => {
 });
 
 test('WebSocket, HTTP mirror, room state, and tombstones share one document', async t => {
-  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'live-cursor-test-'));
-  const serverEntry = fs.existsSync(path.resolve(__dirname, '..', 'server.bundle.js'))
-    ? 'server.bundle.js'
-    : 'server.js';
-  const server = spawn(process.execPath, [serverEntry], {
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'laplas-cowork-test-'));
+  const sharedSecret = 'integration-test-secret';
+  const server = spawn(process.execPath, ['server.js'], {
     cwd: path.resolve(__dirname, '..'),
-    env: { ...process.env, PORT: '0', DB_DIR: dbDir },
+    env: { ...process.env, PORT: '0', DB_DIR: dbDir, LAPLAS_COWORK_SECRET: sharedSecret },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let serverOutput = '';
@@ -66,7 +64,7 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
       connect: false,
       disableBc: true,
       WebSocketPolyfill: WebSocket,
-      params: { workspace, path: filePath }
+      params: { workspace, path: filePath, pass: sharedSecret }
     });
     providers.push(provider);
     return provider;
@@ -80,8 +78,9 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
   await waitFor(() => second.getText('content').toString() === 'live update', 'WebSocket update did not reach peer');
   await new Promise(resolve => setTimeout(resolve, 650));
 
-  const query = new URLSearchParams({ workspace, path: filePath, room });
+  const query = new URLSearchParams({ workspace, path: filePath, room, pass: sharedSecret });
   const apiUrl = `http://127.0.0.1:${port}/api`;
+  assert.equal((await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}`)).status, 401);
   const downloaded = await fetch(`${apiUrl}/download?${query}`).then(response => response.text());
   assert.equal(downloaded, 'live update');
 
@@ -104,7 +103,7 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
 
   const deleteResponse = await fetch(`${apiUrl}/delete?${query}&user=test-device`, { method: 'DELETE' });
   assert.equal(deleteResponse.status, 200);
-  const manifest = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}`).then(response => response.json());
+  const manifest = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}`).then(response => response.json());
   assert.equal(manifest[filePath].deleted, true);
   assert.match(manifest[filePath].hash, /^[a-f0-9]{64}$/);
 });

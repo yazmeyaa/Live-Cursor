@@ -1,15 +1,15 @@
-# 🚀 Live Cursor Collaboration Test Note
+# 🚀 Laplas Cowork Collaboration Test Note
 
 Welcome to your custom test vault! 
 
-This directory is pre-configured as an Obsidian vault with the **Live-Cursor** plugin compiled and automatically enabled.
+This directory is pre-configured as an Obsidian vault with the **Laplas Cowork** plugin compiled and automatically enabled.
 
 ---
 
 ## 🧪 How to Test Phase 2:
 1. Open this directory (`TestVault`) as a Vault in Obsidian.
 2. Open this file (`Welcome.md`) in the editor.
-3. Click the **Users** ribbon icon on the left panel (or press `Ctrl + P` to open the Command Palette, search for **"Live Cursor: Simulate Remote Collaborator Activity"**, and hit Enter).
+3. Click the **Users** ribbon icon on the left panel (or press `Ctrl + P` to open the Command Palette, search for **"Laplas Cowork: Simulate Remote Collaborator Activity"**, and hit Enter).
 4. Watch **Jane Doe (Simulated)** join the note! 
 5. She will begin:
    - Incremental typing movements.

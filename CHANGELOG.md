@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.0] - 2026-08-27
+
+### Changed
+- Prepared the fork for Community Plugins under the stable `laplas-cowork` ID and `Laplas Cowork` name.
+- Embedded the desktop sync daemon into `main.js`; releases no longer require a non-standard server asset.
+- Excluded installed plugin code from whole-vault synchronization.
+
+### Security
+- Added mandatory shared-secret authentication for HTTP and WebSocket connections.
+- Removed request logging that could expose credentials in URLs.
+
 ## [1.3.17] - 2026-05-27
 
 ### Added

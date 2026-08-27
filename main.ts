@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, debounce, requestUrl } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, Platform, debounce, requestUrl } from 'obsidian';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
@@ -8,6 +8,7 @@ import { collaborationExtension } from './collabExtension';
 import { reconcileYText } from './reconcile';
 import { ConfigSyncEngine } from './configSync';
 import { getFileRoomName } from './syncProtocol';
+import embeddedServerSource from './server.js?embedded';
 
 // Electron/Node APIs — only available on desktop
 declare const require: (module: string) => any;
@@ -36,31 +37,33 @@ export function normalizeServerUrl(url: string): string {
   return cleaned;
 }
 
-interface LiveCursorSettings {
+interface LaplasCoworkSettings {
   nickname: string;
   cursorColor: string;
   roomName: string;
   signalingUrl: string;
+  sharedSecret: string;
 }
 
-const DEFAULT_SETTINGS: LiveCursorSettings = {
+const DEFAULT_SETTINGS: LaplasCoworkSettings = {
   nickname: 'Me',
   cursorColor: '#6366f1',
-  roomName: 'default-live-cursor-room',
-  signalingUrl: 'ws://localhost:4444'
+  roomName: 'default-laplas-cowork-room',
+  signalingUrl: 'ws://localhost:4444',
+  sharedSecret: ''
 }
 
 type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
 
-export default class LiveCursorPlugin extends Plugin {
-  settings!: LiveCursorSettings;
+export default class LaplasCoworkPlugin extends Plugin {
+  settings!: LaplasCoworkSettings;
   public activeSyncs: Map<string, { doc: Y.Doc, awareness: Awareness, provider: WebsocketProvider, initialized: boolean }> = new Map();
   private simulatorInterval: any = null;
   private statusBarItem: HTMLElement | null = null;
   private diskDebouncers: Map<string, (file: TFile) => void> = new Map();
   private connectionStatus: ConnectionStatus = 'disconnected';
   private serverProcess: any = null;
-  private settingsTab: LiveCursorSettingTab | null = null;
+  private settingsTab: LaplasCoworkSettingTab | null = null;
   public configSyncEngine: ConfigSyncEngine | null = null;
 
   async onload() {
@@ -73,18 +76,18 @@ export default class LiveCursorPlugin extends Plugin {
     this.configSyncEngine = new ConfigSyncEngine(
       this.app,
       serverUrl,
-      this.settings.nickname, // Basic auth placeholder
-      'default-pass',
+      this.settings.nickname,
+      this.settings.sharedSecret,
       this.settings.roomName, // Using room name as workspace name
       this.settings.nickname,
-      (path) => this.activeSyncs.has(path)
+      (path) => this.activeSyncs.has(path),
+      `${this.app.vault.configDir}/plugins/${this.manifest.id}/data`
     );
 
     // Start local server automatically on desktop if configured for localhost
     if (this.isDesktop()) {
       const isLocal = serverUrl.includes('localhost') || serverUrl.includes('127.0.0.1');
       if (isLocal) {
-        console.log('[LiveCursor] Local URL configured. Auto-starting local sync server in the background.');
         this.startLocalServer(true);
       }
     }
@@ -125,7 +128,7 @@ export default class LiveCursorPlugin extends Plugin {
       callback: () => { this.cleanupAndMergeConflicts(); }
     });
 
-    this.settingsTab = new LiveCursorSettingTab(this.app, this);
+    this.settingsTab = new LaplasCoworkSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
 
     // Listen to file opens
@@ -151,7 +154,6 @@ export default class LiveCursorPlugin extends Plugin {
 
         for (const [path, sync] of this.activeSyncs.entries()) {
           if (!openPaths.has(path)) {
-            console.log(`[LiveCursor] Cleaning up closed file: ${path}`);
             sync.provider.destroy();
             sync.doc.destroy();
             this.activeSyncs.delete(path);
@@ -245,12 +247,7 @@ export default class LiveCursorPlugin extends Plugin {
   // ─────────────────────────────────────────────
 
   isDesktop(): boolean {
-    try {
-      require('child_process');
-      return true;
-    } catch {
-      return false;
-    }
+    return Platform.isDesktopApp;
   }
 
   isServerRunning(): boolean {
@@ -266,45 +263,54 @@ export default class LiveCursorPlugin extends Plugin {
       if (!silent) new Notice('Local server is already running on port 4444.');
       return;
     }
+    if (!this.settings.sharedSecret) {
+      if (!silent) new Notice('Set a shared secret before starting the local server.');
+      return;
+    }
 
     try {
       const { spawn } = require('child_process');
       const path = require('path');
       const fs = require('fs');
+      const electronProcess = (globalThis as any).process;
+      if (!electronProcess?.execPath) throw new Error('The desktop runtime executable could not be found.');
 
-      // Find the plugin folder — server.js lives alongside main.js
-      const pluginDir = (this.app.vault.adapter as any).getBasePath
-        ? path.join((this.app.vault.adapter as any).getBasePath(), '.obsidian', 'plugins', 'live-cursor')
-        : (this.manifest as any).dir || '';
+      const basePath = (this.app.vault.adapter as any).getBasePath?.();
+      if (!basePath) throw new Error('This vault adapter does not expose a local filesystem path.');
+      const pluginDir = path.join(
+        basePath,
+        this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`
+      );
+      const dataDir = path.join(pluginDir, 'data');
+      const serverPath = path.join(dataDir, 'server.bundle.js');
+      fs.mkdirSync(dataDir, { recursive: true });
+      if (!fs.existsSync(serverPath) || fs.readFileSync(serverPath, 'utf8') !== embeddedServerSource) {
+        fs.writeFileSync(serverPath, embeddedServerSource, { encoding: 'utf8', mode: 0o600 });
+      }
 
-      const bundledServerPath = path.join(pluginDir, 'server.bundle.js');
-      const serverPath = fs.existsSync(bundledServerPath)
-        ? bundledServerPath
-        : path.join(pluginDir, 'server.js');
-      console.log(`[LiveCursor] Starting server at: ${serverPath}`);
-
-      this.serverProcess = spawn('node', [serverPath], {
+      this.serverProcess = spawn(electronProcess.execPath, [serverPath], {
         detached: false,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-
-      this.serverProcess.stdout.on('data', (data: Buffer) => {
-        console.log(`[LiveCursor Server] ${data.toString().trim()}`);
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: {
+          ...electronProcess.env,
+          ELECTRON_RUN_AS_NODE: '1',
+          DB_DIR: dataDir,
+          LAPLAS_COWORK_SECRET: this.settings.sharedSecret
+        }
       });
 
       this.serverProcess.stderr.on('data', (data: Buffer) => {
-        console.error(`[LiveCursor Server ERR] ${data.toString().trim()}`);
+        console.error(`[LaplasCowork Server ERR] ${data.toString().trim()}`);
       });
 
       this.serverProcess.on('error', (err: Error) => {
-        console.error('[LiveCursor] Failed to start server:', err);
+        console.error('[LaplasCowork] Failed to start server:', err);
         new Notice(`❌ Failed to start server: ${err.message}`);
         this.serverProcess = null;
         this.settingsTab?.display();
       });
 
       this.serverProcess.on('exit', (code: number) => {
-        console.log(`[LiveCursor] Server exited with code ${code}`);
         this.serverProcess = null;
         this.settingsTab?.display();
         this.updateStatusBar();
@@ -319,7 +325,7 @@ export default class LiveCursorPlugin extends Plugin {
       }, 1500);
 
     } catch (err: any) {
-      console.error('[LiveCursor] Cannot start server:', err);
+      console.error('[LaplasCowork] Cannot start server:', err);
       new Notice(`❌ Cannot start server: ${err.message}`);
     }
   }
@@ -336,7 +342,7 @@ export default class LiveCursorPlugin extends Plugin {
       this.settingsTab?.display();
       this.updateStatusBar();
     } catch (err: any) {
-      console.error('[LiveCursor] Failed to stop server:', err);
+      console.error('[LaplasCowork] Failed to stop server:', err);
       new Notice(`❌ Failed to stop server: ${err.message}`);
     }
   }
@@ -383,7 +389,9 @@ export default class LiveCursorPlugin extends Plugin {
       // 2. Call reconstruct API on server
       const serverUrl = normalizeServerUrl(this.configSyncEngine.serverUrl);
       const httpUrl = `${serverUrl.replace(/^ws/i, 'http')}/api/reconstruct-db` +
-        `?user=${encodeURIComponent(this.settings.nickname)}&workspace=${encodeURIComponent(this.settings.roomName)}`;
+        `?user=${encodeURIComponent(this.settings.nickname)}` +
+        `&pass=${encodeURIComponent(this.settings.sharedSecret)}` +
+        `&workspace=${encodeURIComponent(this.settings.roomName)}`;
       const res = await requestUrl({ url: httpUrl, method: 'POST' });
 
       if (res.status !== 200) {
@@ -400,7 +408,7 @@ export default class LiveCursorPlugin extends Plugin {
 
       new Notice('✅ Database successfully reconstructed! All devices connected.', 4000);
     } catch (err: any) {
-      console.error('[LiveCursor] Database reconstruction failed:', err);
+      console.error('[LaplasCowork] Database reconstruction failed:', err);
       new Notice(`❌ Database reconstruction failed: ${err.message || err}`, 5000);
     }
   }
@@ -480,14 +488,14 @@ export default class LiveCursorPlugin extends Plugin {
               configurable: true
             });
           } catch (e) {
-            console.warn('[LiveCursor] Failed to override hasFocus getter:', e);
+            console.warn('[LaplasCowork] Failed to override hasFocus getter:', e);
           }
 
           // Create or reuse the compartment stored on the CM instance
-          let compartment = (cm as any)._liveCursorCompartment as Compartment | undefined;
+          let compartment = (cm as any)._laplasCoworkCompartment as Compartment | undefined;
           if (!compartment) {
             compartment = new Compartment();
-            (cm as any)._liveCursorCompartment = compartment;
+            (cm as any)._laplasCoworkCompartment = compartment;
             cm.dispatch({ effects: StateEffect.appendConfig.of(compartment.of([])) });
           }
 
@@ -525,14 +533,13 @@ export default class LiveCursorPlugin extends Plugin {
           setTimeout(pingAwareness, 500); // Follow-up ping for reliability
 
           boundCount++;
-          console.log(`[LiveCursor] Editor bound for ${file.path}`);
         }
       });
       if (boundCount === 0 && retries < 20) {
         retries++;
         setTimeout(bind, 100);
       } else if (boundCount === 0) {
-        console.warn(`[LiveCursor] Could not bind editor for ${file.path} after ${retries} retries`);
+        console.warn(`[LaplasCowork] Could not bind editor for ${file.path} after ${retries} retries`);
       }
     };
     bind();
@@ -542,7 +549,7 @@ export default class LiveCursorPlugin extends Plugin {
     this.app.workspace.iterateAllLeaves((leaf) => {
       if (leaf.view instanceof MarkdownView && leaf.view.file?.path === path) {
         const cm = (leaf.view.editor as any).cm as EditorView | undefined;
-        const compartment = (cm as any)?._liveCursorCompartment as Compartment | undefined;
+        const compartment = (cm as any)?._laplasCoworkCompartment as Compartment | undefined;
         if (cm && compartment) cm.dispatch({ effects: compartment.reconfigure([]) });
       }
     });
@@ -579,7 +586,7 @@ export default class LiveCursorPlugin extends Plugin {
     }
     const conflictPath = `${conflictDir}/${base} (Local before sync ${stamp})${ext}`;
     await this.app.vault.adapter.write(conflictPath, content);
-    new Notice(`Live Cursor preserved local edits in ${conflictPath}`, 6000);
+    new Notice(`Laplas Cowork preserved local edits in ${conflictPath}`, 6000);
   }
 
   // ─────────────────────────────────────────────
@@ -593,7 +600,6 @@ export default class LiveCursorPlugin extends Plugin {
       return;
     }
 
-    console.log(`[LiveCursor] Starting sync for ${file.path}`);
     const doc = new Y.Doc();
     const ytext = doc.getText('content');
 
@@ -612,7 +618,11 @@ export default class LiveCursorPlugin extends Plugin {
     const provider = new WebsocketProvider(serverUrl, fileRoomName, doc, {
       awareness,
       connect: false,
-      params: { workspace: this.settings.roomName, path: file.path }
+      params: {
+        workspace: this.settings.roomName,
+        path: file.path,
+        pass: this.settings.sharedSecret
+      }
     });
 
     const sync = { doc, awareness, provider, initialized: false };
@@ -636,8 +646,8 @@ export default class LiveCursorPlugin extends Plugin {
         try {
           await this.preserveLocalConflict(file, currentLocalContent);
         } catch (error) {
-          console.error(`[LiveCursor] Failed to preserve local conflict for ${file.path}:`, error);
-          new Notice(`Live Cursor could not preserve local edits for ${file.path}`, 8000);
+          console.error(`[LaplasCowork] Failed to preserve local conflict for ${file.path}:`, error);
+          new Notice(`Laplas Cowork could not preserve local edits for ${file.path}`, 8000);
           hasInitialized = false;
           return;
         }
@@ -668,8 +678,6 @@ export default class LiveCursorPlugin extends Plugin {
 
     // ── Real connection status tracking ──
     provider.on('status', ({ status }: { status: string }) => {
-      console.log(`[LiveCursor] Provider status for ${file.path}: ${status}`);
-
       if (status === 'connected') {
         this.connectionStatus = 'connected';
         // Trigger background vault sync if not already syncing
@@ -769,7 +777,7 @@ export default class LiveCursorPlugin extends Plugin {
     if (!this.statusBarItem) return;
 
     if (this.simulatorInterval) {
-      this.statusBarItem.setText('Live Cursor 🟣 Simulating');
+      this.statusBarItem.setText('Laplas Cowork 🟣 Simulating');
       return;
     }
 
@@ -782,13 +790,13 @@ export default class LiveCursorPlugin extends Plugin {
     }
 
     if (connected > 0) {
-      this.statusBarItem.setText(`Live Cursor 🟢 ${connected} synced`);
+      this.statusBarItem.setText(`Laplas Cowork 🟢 ${connected} synced`);
     } else if (connecting > 0) {
-      this.statusBarItem.setText('Live Cursor 🟡 Connecting...');
+      this.statusBarItem.setText('Laplas Cowork 🟡 Connecting...');
     } else if (this.activeSyncs.size > 0) {
-      this.statusBarItem.setText('Live Cursor 🔴 Disconnected');
+      this.statusBarItem.setText('Laplas Cowork 🔴 Disconnected');
     } else {
-      this.statusBarItem.setText('Live Cursor ⚪ Standby');
+      this.statusBarItem.setText('Laplas Cowork ⚪ Standby');
     }
   }
 
@@ -798,6 +806,11 @@ export default class LiveCursorPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!this.settings.sharedSecret) {
+      const bytes = globalThis.crypto.getRandomValues(new Uint8Array(24));
+      this.settings.sharedSecret = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
@@ -809,10 +822,10 @@ export default class LiveCursorPlugin extends Plugin {
 // SETTINGS TAB
 // ─────────────────────────────────────────────────────────────────
 
-class LiveCursorSettingTab extends PluginSettingTab {
-  plugin: LiveCursorPlugin;
+class LaplasCoworkSettingTab extends PluginSettingTab {
+  plugin: LaplasCoworkPlugin;
 
-  constructor(app: App, plugin: LiveCursorPlugin) {
+  constructor(app: App, plugin: LaplasCoworkPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -824,7 +837,7 @@ class LiveCursorSettingTab extends PluginSettingTab {
     // ── Header ──
     const header = containerEl.createEl('div');
     header.style.marginBottom = '24px';
-    const title = header.createEl('h2', { text: 'Live Cursor Settings' });
+    const title = header.createEl('h2', { text: 'Laplas Cowork Settings' });
     title.style.margin = '0 0 6px 0';
     const subtitle = header.createEl('p', { text: 'Real-time collaborative editing for your Obsidian vault.' });
     subtitle.style.margin = '0';
@@ -834,32 +847,13 @@ class LiveCursorSettingTab extends PluginSettingTab {
     // ── Quick-Start Tutorial Card ──
     const tutorialCard = containerEl.createEl('div');
     tutorialCard.style.cssText = 'background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(139, 92, 246, 0.05) 100%); border: 1px solid rgba(99, 102, 241, 0.22); border-radius: 12px; padding: 18px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);';
-    tutorialCard.innerHTML = `
-      <h3 style="margin: 0 0 8px 0; color: var(--text-accent); font-size: 1.1em; display: flex; align-items: center; gap: 8px;">🎓 Quick-Start Collaboration Guide</h3>
-      <p style="margin: 0 0 14px 0; font-size: var(--font-ui-small); color: var(--text-muted); line-height: 1.45;">Follow these simple steps to start collaborating and syncing in real time:</p>
-      
-      <div style="display: flex; flex-direction: column; gap: 12px; font-size: var(--font-ui-small); line-height: 1.45;">
-        <div style="display: flex; align-items: flex-start; gap: 10px;">
-          <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">1</div>
-          <div><strong>Start Local Host (On PC)</strong>: Toggle the <strong>Local Server</strong> below to <span style="color: var(--text-success); font-weight: 600;">🟢 Running</span>. (Your PC acts as the secure host).</div>
-        </div>
-        
-        <div style="display: flex; align-items: flex-start; gap: 10px;">
-          <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">2</div>
-          <div><strong>Connect from Mobile / Laptop</strong>: Ensure all devices are on the same Wi-Fi. Enter your PC's IP address (e.g. <code>ws://YOUR_PC_IP:4444</code>) in the <strong>Server Connection URL</strong> on the other devices.</div>
-        </div>
-        
-        <div style="display: flex; align-items: flex-start; gap: 10px;">
-          <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">3</div>
-          <div><strong>Set Room Name</strong>: All devices collaborating together must use the exact same <strong>Room Name</strong> (e.g. <code>my-shared-room</code>).</div>
-        </div>
-
-        <div style="display: flex; align-items: flex-start; gap: 10px;">
-          <div style="background: var(--interactive-accent); color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold; font-size: 11px;">4</div>
-          <div><strong>Collaborate!</strong>: Open any markdown note and start typing! Remote cursors and highlight ranges will render in real time.</div>
-        </div>
-      </div>
-    `;
+    tutorialCard.createEl('h3', { text: '🎓 Quick-Start Collaboration Guide' });
+    tutorialCard.createEl('p', { text: 'Use the same server URL, room name, and shared secret on every device.' });
+    const steps = tutorialCard.createEl('ol');
+    steps.createEl('li', { text: 'On a desktop, start the local server.' });
+    steps.createEl('li', { text: 'On other devices, enter the host address, for example ws://192.168.1.12:4444.' });
+    steps.createEl('li', { text: 'Copy the room name and shared secret exactly.' });
+    steps.createEl('li', { text: 'Open the same note on each device.' });
 
     // ── Section: Profile ──
     containerEl.createEl('h3', { text: '👤 Your Profile', attr: { style: sectionHeaderStyle() } });
@@ -932,11 +926,13 @@ class LiveCursorSettingTab extends PluginSettingTab {
     if (isRunning) {
       statusEl.style.background = 'rgba(34, 197, 94, 0.12)';
       statusEl.style.border = '1px solid rgba(34, 197, 94, 0.3)';
-      statusEl.innerHTML = '<span style="font-size:16px">🟢</span> <span><strong>Server running</strong> on port 4444 — your devices can connect.</span>';
+      statusEl.createSpan({ text: '🟢' });
+      statusEl.createSpan({ text: 'Server running on port 4444 — your devices can connect.' });
     } else {
       statusEl.style.background = 'rgba(239, 68, 68, 0.1)';
       statusEl.style.border = '1px solid rgba(239, 68, 68, 0.25)';
-      statusEl.innerHTML = '<span style="font-size:16px">🔴</span> <span><strong>Server not running.</strong> Start it below to enable local sync.</span>';
+      statusEl.createSpan({ text: '🔴' });
+      statusEl.createSpan({ text: 'Server not running. Start it below to enable local sync.' });
     }
 
     // Server start/stop buttons
@@ -963,12 +959,9 @@ class LiveCursorSettingTab extends PluginSettingTab {
     // Show local IP hint
     const ipHint = containerEl.createEl('div');
     ipHint.style.cssText = 'margin: 0 0 16px 0; padding: 10px 14px; background: var(--background-secondary); border-radius: 8px; font-size: var(--font-ui-small); color: var(--text-muted);';
-    ipHint.innerHTML = `
-      <strong>📱 Connecting from mobile or another device?</strong><br>
-      Find your PC's local IP with <code>ipconfig</code> (Windows) or <code>ifconfig</code> (Mac/Linux),
-      then set the server URL below to <code>ws://YOUR_PC_IP:4444</code> on all devices.<br>
-      <span style="opacity:0.7">Example: <code>ws://192.168.1.12:4444</code></span>
-    `;
+    ipHint.createEl('strong', { text: '📱 Connecting from mobile or another device?' });
+    ipHint.createEl('div', { text: 'Find the desktop host IP and use ws://YOUR_PC_IP:4444 on the other devices.' });
+    ipHint.createEl('code', { text: 'Example: ws://192.168.1.12:4444' });
 
     // ── Section: Connection ──
     containerEl.createEl('h3', { text: '🔗 Connection & Room', attr: { style: sectionHeaderStyle() } });
@@ -977,10 +970,10 @@ class LiveCursorSettingTab extends PluginSettingTab {
       .setName('Room Name')
       .setDesc('All devices must use the exact same room name to collaborate together.')
       .addText(text => text
-        .setPlaceholder('default-live-cursor-room')
+        .setPlaceholder('default-laplas-cowork-room')
         .setValue(this.plugin.settings.roomName)
         .onChange(async (val) => {
-          this.plugin.settings.roomName = val || 'default-live-cursor-room';
+          this.plugin.settings.roomName = val || 'default-laplas-cowork-room';
           if (this.plugin.configSyncEngine) {
             this.plugin.configSyncEngine.workspace = this.plugin.settings.roomName;
           }
@@ -1002,6 +995,27 @@ class LiveCursorSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('Shared Secret')
+      .setDesc('Required by the server. Copy the same generated value to every device. Restart the local server after changing it.')
+      .addText(text => {
+        text.inputEl.type = 'password';
+        return text
+          .setPlaceholder('Generated automatically')
+          .setValue(this.plugin.settings.sharedSecret)
+          .onChange(async (val) => {
+            this.plugin.settings.sharedSecret = val.trim();
+            if (this.plugin.configSyncEngine) this.plugin.configSyncEngine.pass = val.trim();
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton(button => button
+        .setButtonText('Copy')
+        .onClick(async () => {
+          await navigator.clipboard.writeText(this.plugin.settings.sharedSecret);
+          new Notice('Shared secret copied.');
+        }));
+
+    new Setting(containerEl)
       .setName('Reconnect All Files')
       .setDesc('Force a reconnection to the server with current settings.')
       .addButton(btn => btn
@@ -1016,7 +1030,7 @@ class LiveCursorSettingTab extends PluginSettingTab {
     
     new Setting(containerEl)
       .setName('Sync Entire Vault Configurations')
-      .setDesc('Synchronize plugins, themes, snippets, and all configuration files to the server database. This happens automatically in the background, but you can force it here.')
+      .setDesc('Synchronize vault files and safe configuration files. Installed plugin code and device-specific workspace state are excluded.')
       .addButton(btn => btn
         .setButtonText('Sync Vault Now')
         .setCta()
