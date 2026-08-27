@@ -1,6 +1,6 @@
 {
   "name": "laplas-cowork",
-  "version": "1.4.1",
+  "version": "2.0.0",
   "description": "Self-hosted real-time collaboration and vault sync for Obsidian.",
   "main": "main.js",
   "scripts": {
