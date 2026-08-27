@@ -15,6 +15,8 @@ This repository is an independently maintained fork of the original Live Cursor 
 
 ## Quick start
 
+Windows users can follow the detailed [Windows installation guide](WINDOWS_INSTALL.md).
+
 1. Install and enable the plugin on each device.
 2. On the desktop that will host synchronization, keep the default `ws://localhost:4444` URL and start the local server.
 3. Open the plugin settings and copy the room name and generated shared secret to every other device.
