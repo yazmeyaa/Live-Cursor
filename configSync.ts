@@ -1,5 +1,5 @@
 import { App, requestUrl, Notice, TFile } from 'obsidian';
-import { encodeQueryValue, getFileRoomName } from './syncProtocol';
+import { decideSyncAction, encodeQueryValue, getFileRoomName, normalizeServerUrl } from './syncProtocol';
 
 export interface FileManifest {
   [filePath: string]: {
@@ -49,7 +49,8 @@ function shouldIgnore(path: string): boolean {
 export class ConfigSyncEngine {
   private isSyncing = false;
   private syncPending = false;
-  private syncStateLoaded = false;
+  private syncStateLoadPromise: Promise<void> | null = null;
+  private syncStateSavePromise: Promise<void> = Promise.resolve();
   private syncState: Record<string, Record<string, string>> = {};
   private syncStateDirty = false;
 
@@ -78,27 +79,7 @@ export class ConfigSyncEngine {
   }
 
   private getApiUrl(endpoint: string): string {
-    let cleaned = this.serverUrl.trim();
-    if (!cleaned) cleaned = 'ws://localhost:4444';
-
-    // 1. If it has no protocol, prepend 'ws://'
-    if (!/^https?:\/\//i.test(cleaned) && !/^wss?:\/\//i.test(cleaned)) {
-      cleaned = 'ws://' + cleaned;
-    }
-
-    // 2. Map http:// -> ws:// and https:// -> wss://
-    if (/^http:\/\//i.test(cleaned)) {
-      cleaned = cleaned.replace(/^http:\/\//i, 'ws://');
-    } else if (/^https:\/\//i.test(cleaned)) {
-      cleaned = cleaned.replace(/^https:\/\//i, 'wss://');
-    }
-
-    // 3. Remove trailing slashes and '/sync' path suffix
-    cleaned = cleaned.replace(/\/+$/, '');
-    cleaned = cleaned.replace(/\/sync\/?$/i, '');
-    cleaned = cleaned.replace(/\/+$/, '');
-
-    let httpUrl = cleaned.replace(/^ws/i, 'http');
+    const httpUrl = normalizeServerUrl(this.serverUrl).replace(/^ws/i, 'http');
     return `${httpUrl}/api${endpoint}`;
   }
 
@@ -150,12 +131,14 @@ export class ConfigSyncEngine {
   }
 
   private get syncScope(): string {
-    return `${this.serverUrl.trim()}|${this.workspace}`;
+    return `${normalizeServerUrl(this.serverUrl)}|${(this.workspace || 'default-workspace').trim() || 'default-workspace'}`;
   }
 
-  private async loadSyncState() {
-    if (this.syncStateLoaded) return;
-    this.syncStateLoaded = true;
+  private loadSyncState(): Promise<void> {
+    return this.syncStateLoadPromise ??= this.readSyncState();
+  }
+
+  private async readSyncState() {
     const statePath = `${this.dataDir}/sync-state.json`;
     try {
       if (await this.app.vault.adapter.exists(statePath)) {
@@ -165,10 +148,43 @@ export class ConfigSyncEngine {
       console.warn('[LaplasCowork] Could not load sync state; rebuilding it from hashes.', error);
       this.syncState = {};
     }
+
+    const legacyPath = `${this.app.vault.configDir}/plugins/live-cursor/data/sync-state.json`;
+    try {
+      if (legacyPath !== statePath && await this.app.vault.adapter.exists(legacyPath)) {
+        const legacyState = JSON.parse(await this.app.vault.adapter.read(legacyPath)) as Record<string, Record<string, string>>;
+        for (const [scope, files] of Object.entries(legacyState)) {
+          const currentFiles = this.syncState[scope] ?? (this.syncState[scope] = {});
+          for (const [path, hash] of Object.entries(files)) {
+            if (currentFiles[path] === undefined) {
+              currentFiles[path] = hash;
+              this.syncStateDirty = true;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[LaplasCowork] Could not migrate legacy sync state.', error);
+    }
   }
 
   private getFileSyncState(path: string): string | undefined {
-    return this.syncState[this.syncScope]?.[path];
+    const normalized = this.syncState[this.syncScope]?.[path];
+    if (normalized !== undefined) return normalized;
+    const legacy = this.syncState[`${this.serverUrl.trim()}|${this.workspace}`]?.[path];
+    if (legacy !== undefined) return legacy;
+
+    const workspaceSuffix = `|${(this.workspace || 'default-workspace').trim() || 'default-workspace'}`;
+    for (const [scope, files] of Object.entries(this.syncState)) {
+      if (
+        scope.endsWith(workspaceSuffix) &&
+        normalizeServerUrl(scope.slice(0, -workspaceSuffix.length)) === normalizeServerUrl(this.serverUrl) &&
+        files[path] !== undefined
+      ) {
+        return files[path];
+      }
+    }
+    return undefined;
   }
 
   private setFileSyncState(path: string, hash: string) {
@@ -179,11 +195,36 @@ export class ConfigSyncEngine {
     this.syncStateDirty = true;
   }
 
-  private async saveSyncState() {
-    if (!this.syncStateDirty) return;
-    await this.app.vault.adapter.mkdir(this.dataDir).catch(() => {});
-    await this.app.vault.adapter.write(`${this.dataDir}/sync-state.json`, JSON.stringify(this.syncState));
-    this.syncStateDirty = false;
+  private saveSyncState(): Promise<void> {
+    const save = this.syncStateSavePromise.then(async () => {
+      if (!this.syncStateDirty) return;
+      const serialized = JSON.stringify(this.syncState);
+      this.syncStateDirty = false;
+      try {
+        await this.app.vault.adapter.mkdir(this.dataDir).catch(() => {});
+        await this.app.vault.adapter.write(`${this.dataDir}/sync-state.json`, serialized);
+      } catch (error) {
+        this.syncStateDirty = true;
+        throw error;
+      }
+    });
+    this.syncStateSavePromise = save.catch(() => {});
+    return save;
+  }
+
+  public async getLastSyncedHash(path: string): Promise<string | undefined> {
+    await this.loadSyncState();
+    return this.getFileSyncState(path);
+  }
+
+  public async recordSyncedHash(path: string, hash: string): Promise<void> {
+    await this.loadSyncState();
+    this.setFileSyncState(path, hash);
+    await this.saveSyncState();
+  }
+
+  public hashText(text: string): Promise<string> {
+    return this.hashData(new TextEncoder().encode(text).buffer as ArrayBuffer);
   }
 
   private async removeLocalFile(path: string) {
@@ -195,9 +236,17 @@ export class ConfigSyncEngine {
   private async preserveConflict(path: string, data: ArrayBuffer, source: string) {
     if (!path.endsWith('.md')) return;
     const safeSource = source.replace(/[\\/:*?"<>|]/g, '-');
-    let conflictPath = this.getConflictPath(path, safeSource);
+    const hash = await this.hashData(data);
+    let conflictPath = this.getConflictPath(path, `${safeSource} ${hash.slice(0, 12)}`);
     if (await this.app.vault.adapter.exists(conflictPath)) {
-      conflictPath = this.getConflictPath(path, `${safeSource} ${Date.now()}`);
+      const existingHash = await this.hashData(await this.app.vault.adapter.readBinary(conflictPath));
+      if (existingHash === hash) return;
+      conflictPath = this.getConflictPath(path, `${safeSource} ${hash}`);
+      if (await this.app.vault.adapter.exists(conflictPath)) {
+        const fullHash = await this.hashData(await this.app.vault.adapter.readBinary(conflictPath));
+        if (fullHash === hash) return;
+        conflictPath = this.getConflictPath(path, `${safeSource} ${hash} ${Date.now()}`);
+      }
     }
     await this.ensureDirExists(conflictPath, '');
     await this.writeToVaultUI(conflictPath, data);
@@ -339,26 +388,22 @@ export class ConfigSyncEngine {
             continue;
           }
 
-          const previousHash = this.getFileSyncState(relPath);
-          const localChanged = previousHash !== undefined && localHash !== previousHash;
-          const remoteChanged = previousHash !== undefined && remoteHash !== previousHash;
+          const decision = decideSyncAction(this.getFileSyncState(relPath), localHash, remoteHash);
 
-          if (localChanged && !remoteChanged) {
+          if (decision === 'upload') {
             await this.uploadFile(relPath, localData, local.stat.mtime);
             this.setFileSyncState(relPath, localHash);
-          } else if (!localChanged && remoteChanged) {
+          } else if (decision === 'download') {
             await this.writeToVaultUI(relPath, remoteData);
             this.setFileSyncState(relPath, remoteHash);
-          } else if (localChanged && remoteChanged) {
+          } else if (relPath.endsWith('.md')) {
             await this.preserveConflict(relPath, localData, this.deviceName);
             await this.writeToVaultUI(relPath, remoteData);
             this.setFileSyncState(relPath, remoteHash);
           } else if (local.stat.mtime > remote.mtime) {
-            await this.preserveConflict(relPath, remoteData, 'Server');
             await this.uploadFile(relPath, localData, local.stat.mtime);
             this.setFileSyncState(relPath, localHash);
           } else {
-            await this.preserveConflict(relPath, localData, this.deviceName);
             await this.writeToVaultUI(relPath, remoteData);
             this.setFileSyncState(relPath, remoteHash);
           }

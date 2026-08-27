@@ -7,35 +7,13 @@ import { Compartment, StateEffect } from '@codemirror/state';
 import { collaborationExtension } from './collabExtension';
 import { reconcileYText } from './reconcile';
 import { ConfigSyncEngine } from './configSync';
-import { getFileRoomName } from './syncProtocol';
+import { decideSyncAction, getFileRoomName, normalizeServerUrl } from './syncProtocol';
 import embeddedServerSource from './server.js?embedded';
 
 // Electron/Node APIs — only available on desktop
 declare const require: (module: string) => any;
 
-export function normalizeServerUrl(url: string): string {
-  let cleaned = (url || '').trim();
-  if (!cleaned) return 'ws://localhost:4444';
-
-  // 1. If it has no protocol, prepend 'ws://'
-  if (!/^https?:\/\//i.test(cleaned) && !/^wss?:\/\//i.test(cleaned)) {
-    cleaned = 'ws://' + cleaned;
-  }
-
-  // 2. Map http:// -> ws:// and https:// -> wss://
-  if (/^http:\/\//i.test(cleaned)) {
-    cleaned = cleaned.replace(/^http:\/\//i, 'ws://');
-  } else if (/^https:\/\//i.test(cleaned)) {
-    cleaned = cleaned.replace(/^https:\/\//i, 'wss://');
-  }
-
-  // 3. Remove trailing slashes and '/sync' path suffix
-  cleaned = cleaned.replace(/\/+$/, '');
-  cleaned = cleaned.replace(/\/sync\/?$/i, '');
-  cleaned = cleaned.replace(/\/+$/, '');
-
-  return cleaned;
-}
+export { normalizeServerUrl } from './syncProtocol';
 
 interface LaplasCoworkSettings {
   nickname: string;
@@ -478,17 +456,11 @@ export default class LaplasCoworkPlugin extends Plugin {
           const cm = (leaf.view.editor as any).cm as EditorView;
           if (!cm) return;
 
-          // Override hasFocus to return true whenever the active Markdown view's path matches the file path.
-          // This prevents y-codemirror from clearing cursor awareness state during focus transitions.
-          try {
-            Object.defineProperty(cm, 'hasFocus', {
-              get: () => {
-                return this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path === file.path;
-              },
-              configurable: true
-            });
-          } catch (e) {
-            console.warn('[LaplasCowork] Failed to override hasFocus getter:', e);
+          // Restore CodeMirror's native focus detection for nested editors such
+          // as Obsidian's table cells. Older plugin versions installed an own
+          // getter here, causing the outer editor to steal their selection.
+          if (Object.prototype.hasOwnProperty.call(cm, 'hasFocus')) {
+            delete (cm as any).hasFocus;
           }
 
           // Create or reuse the compartment stored on the CM instance
@@ -566,7 +538,7 @@ export default class LaplasCoworkPlugin extends Plugin {
     return editorContent ?? await this.app.vault.read(file);
   }
 
-  private async preserveLocalConflict(file: TFile, content: string) {
+  private async preserveLocalConflict(file: TFile, content: string, hash: string) {
     const normalized = file.path.replace(/\\/g, '/');
     const slash = normalized.lastIndexOf('/');
     const parent = slash === -1 ? '' : normalized.slice(0, slash);
@@ -574,7 +546,6 @@ export default class LaplasCoworkPlugin extends Plugin {
     const dot = name.lastIndexOf('.');
     const base = dot > 0 ? name.slice(0, dot) : name;
     const ext = dot > 0 ? name.slice(dot) : '';
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const conflictDir = `Sync Conflicts/${parent}`.replace(/\/$/, '');
     await this.app.vault.adapter.mkdir('Sync Conflicts').catch(() => {});
     if (parent) {
@@ -584,7 +555,15 @@ export default class LaplasCoworkPlugin extends Plugin {
         await this.app.vault.adapter.mkdir(current).catch(() => {});
       }
     }
-    const conflictPath = `${conflictDir}/${base} (Local before sync ${stamp})${ext}`;
+    let conflictPath = `${conflictDir}/${base} (Local before sync ${hash.slice(0, 12)})${ext}`;
+    if (await this.app.vault.adapter.exists(conflictPath)) {
+      if (await this.app.vault.adapter.read(conflictPath) === content) return;
+      conflictPath = `${conflictDir}/${base} (Local before sync ${hash})${ext}`;
+      if (await this.app.vault.adapter.exists(conflictPath)) {
+        if (await this.app.vault.adapter.read(conflictPath) === content) return;
+        conflictPath = `${conflictDir}/${base} (Local before sync ${hash} ${Date.now()})${ext}`;
+      }
+    }
     await this.app.vault.adapter.write(conflictPath, content);
     new Notice(`Laplas Cowork preserved local edits in ${conflictPath}`, 6000);
   }
@@ -637,21 +616,45 @@ export default class LaplasCoworkPlugin extends Plugin {
 
       const currentLocalContent = await this.getCurrentFileContent(file);
       if (this.activeSyncs.get(file.path) !== sync) return;
-      if (ytext.toString() === '') {
-        ytext.insert(0, currentLocalContent);
-      } else if (ytext.toString() !== currentLocalContent) {
-        // A plain local file has no Yjs history, so pretending it is a CRDT
-        // update can overwrite newer remote edits. Preserve it and let the
-        // synchronized Y.Doc remain authoritative.
+      const remoteContent = ytext.toString();
+      const syncEngine = this.configSyncEngine;
+      if (!syncEngine) return;
+
+      const [localHash, remoteHash, baseHash] = await Promise.all([
+        syncEngine.hashText(currentLocalContent),
+        syncEngine.hashText(remoteContent),
+        syncEngine.getLastSyncedHash(file.path)
+      ]);
+      if (this.activeSyncs.get(file.path) !== sync) return;
+
+      let decision = decideSyncAction(baseHash, localHash, remoteHash);
+      // An empty room without a baseline is new, so seed it from the local file.
+      if (decision === 'bootstrap' && remoteContent === '') decision = 'upload';
+
+      let syncedHash: string | undefined = remoteHash;
+      if (decision === 'upload') {
+        reconcileYText(ytext, currentLocalContent);
+        // y-websocket has no per-update acknowledgement. Keep the previous
+        // baseline until a later equality check confirms the server received it.
+        syncedHash = undefined;
+      } else if (decision === 'download') {
+        await this.app.vault.modify(file, remoteContent);
+      } else if (decision === 'conflict' || decision === 'bootstrap') {
         try {
-          await this.preserveLocalConflict(file, currentLocalContent);
+          await this.preserveLocalConflict(file, currentLocalContent, localHash);
         } catch (error) {
           console.error(`[LaplasCowork] Failed to preserve local conflict for ${file.path}:`, error);
           new Notice(`Laplas Cowork could not preserve local edits for ${file.path}`, 8000);
           hasInitialized = false;
           return;
         }
-        await this.app.vault.modify(file, ytext.toString());
+        await this.app.vault.modify(file, remoteContent);
+      }
+
+      if (syncedHash !== undefined) {
+        await syncEngine.recordSyncedHash(file.path, syncedHash).catch(error => {
+          console.warn(`[LaplasCowork] Could not record sync state for ${file.path}:`, error);
+        });
       }
 
       if (this.activeSyncs.get(file.path) !== sync) return;
