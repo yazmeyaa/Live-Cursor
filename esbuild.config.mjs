@@ -13,7 +13,7 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
-const context = await esbuild.context({
+const clientContext = await esbuild.context({
 	banner: {
 		js: banner,
 	},
@@ -65,9 +65,21 @@ const context = await esbuild.context({
 	outfile: "main.js",
 });
 
+const serverContext = await esbuild.context({
+	entryPoints: ["server.js"],
+	bundle: true,
+	platform: "node",
+	format: "cjs",
+	target: "node18",
+	logLevel: "info",
+	sourcemap: prod ? false : "inline",
+	outfile: "server.bundle.js",
+});
+
 if (prod) {
-	await context.rebuild();
+	await Promise.all([clientContext.rebuild(), serverContext.rebuild()]);
+	await Promise.all([clientContext.dispose(), serverContext.dispose()]);
 	process.exit(0);
 } else {
-	await context.watch();
+	await Promise.all([clientContext.watch(), serverContext.watch()]);
 }

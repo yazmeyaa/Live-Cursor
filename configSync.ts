@@ -1,31 +1,14 @@
-import { App, requestUrl, Notice } from 'obsidian';
-import * as Y from 'yjs';
-import { reconcileYText } from './reconcile';
+import { App, requestUrl, Notice, TFile } from 'obsidian';
+import { encodeQueryValue, getFileRoomName } from './syncProtocol';
 
 export interface FileManifest {
   [filePath: string]: {
     size: number;
     mtime: number;
+    hash?: string;
+    deleted?: boolean;
     device?: string;
   };
-}
-
-function deepMerge(target: any, source: any): any {
-  if (typeof target !== 'object' || target === null || typeof source !== 'object' || source === null) {
-    return source !== undefined ? source : target;
-  }
-  if (Array.isArray(target) || Array.isArray(source)) {
-    return source;
-  }
-  const merged = { ...target };
-  for (const key of Object.keys(source)) {
-    if (source[key] instanceof Object && key in target) {
-      merged[key] = deepMerge(target[key], source[key]);
-    } else {
-      merged[key] = source[key];
-    }
-  }
-  return merged;
 }
 
 /**
@@ -40,6 +23,7 @@ function shouldIgnore(path: string): boolean {
     normalized.startsWith('.git/') || normalized === '.git' ||
     normalized.startsWith('.trash/') || normalized === '.trash' ||
     normalized.startsWith('node_modules/') || normalized === 'node_modules' ||
+    normalized.startsWith('.obsidian/plugins/live-cursor/') || normalized === '.obsidian/plugins/live-cursor' ||
     normalized.startsWith('Sync Conflicts/') || normalized === 'Sync Conflicts'
   ) {
     return true;
@@ -68,7 +52,11 @@ function shouldIgnore(path: string): boolean {
 }
 
 export class ConfigSyncEngine {
-  private static isSyncing = false;
+  private isSyncing = false;
+  private syncPending = false;
+  private syncStateLoaded = false;
+  private syncState: Record<string, Record<string, string>> = {};
+  private syncStateDirty = false;
 
   constructor(
     private app: App,
@@ -76,8 +64,22 @@ export class ConfigSyncEngine {
     private user: string,
     private pass: string,
     public workspace: string = 'default-workspace',
-    private deviceName: string = 'Unknown Device'
+    private deviceName: string = 'Unknown Device',
+    private isLivePath: (path: string) => boolean = () => false
   ) {}
+
+  private getQuery(relativePath?: string): string {
+    const values = [
+      `user=${encodeQueryValue(this.user)}`,
+      `pass=${encodeQueryValue(this.pass)}`,
+      `workspace=${encodeQueryValue(this.workspace)}`
+    ];
+    if (relativePath !== undefined) {
+      values.push(`path=${encodeQueryValue(relativePath)}`);
+      values.push(`room=${encodeQueryValue(getFileRoomName(this.workspace, relativePath))}`);
+    }
+    return values.join('&');
+  }
 
   private getApiUrl(endpoint: string): string {
     let cleaned = this.serverUrl.trim();
@@ -105,14 +107,14 @@ export class ConfigSyncEngine {
   }
 
   private async getRemoteManifest(): Promise<FileManifest> {
-    const url = `${this.getApiUrl('/manifest')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}`;
+    const url = `${this.getApiUrl('/manifest')}?${this.getQuery()}`;
     const res = await requestUrl({ url, method: 'GET' });
     if (res.status !== 200) throw new Error(`Server returned HTTP ${res.status}: ${res.text || 'No response body'}`);
     return res.json as FileManifest;
   }
 
   private async uploadFile(relativePath: string, data: ArrayBuffer, mtime: number) {
-    const url = `${this.getApiUrl('/upload')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}&mtime=${mtime}`;
+    const url = `${this.getApiUrl('/upload')}?${this.getQuery(relativePath)}&mtime=${mtime}`;
     const res = await requestUrl({
       url,
       method: 'POST',
@@ -122,7 +124,7 @@ export class ConfigSyncEngine {
   }
 
   private async downloadFile(relativePath: string): Promise<ArrayBuffer> {
-    const url = `${this.getApiUrl('/download')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}`;
+    const url = `${this.getApiUrl('/download')}?${this.getQuery(relativePath)}`;
     const res = await requestUrl({ url, method: 'GET' });
     if (res.status !== 200) throw new Error('Download failed');
     return res.arrayBuffer;
@@ -131,7 +133,7 @@ export class ConfigSyncEngine {
   public async deleteRemoteFile(relativePath: string) {
     if (shouldIgnore(relativePath)) return;
     try {
-      const url = `${this.getApiUrl('/delete')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relativePath)}`;
+      const url = `${this.getApiUrl('/delete')}?${this.getQuery(relativePath)}`;
       await requestUrl({ url, method: 'DELETE' });
     } catch (e) {
       console.warn(`[LiveCursor] Failed to delete remote file ${relativePath}:`, e);
@@ -144,6 +146,66 @@ export class ConfigSyncEngine {
    */
   private async writeToVaultUI(relPath: string, data: ArrayBuffer) {
     await this.app.vault.adapter.writeBinary(relPath, data);
+  }
+
+  private async hashData(data: ArrayBuffer): Promise<string> {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  private get syncScope(): string {
+    return `${this.serverUrl.trim()}|${this.workspace}`;
+  }
+
+  private async loadSyncState() {
+    if (this.syncStateLoaded) return;
+    this.syncStateLoaded = true;
+    const statePath = '.obsidian/plugins/live-cursor/data/sync-state.json';
+    try {
+      if (await this.app.vault.adapter.exists(statePath)) {
+        this.syncState = JSON.parse(await this.app.vault.adapter.read(statePath));
+      }
+    } catch (error) {
+      console.warn('[LiveCursor] Could not load sync state; rebuilding it from hashes.', error);
+      this.syncState = {};
+    }
+  }
+
+  private getFileSyncState(path: string): string | undefined {
+    return this.syncState[this.syncScope]?.[path];
+  }
+
+  private setFileSyncState(path: string, hash: string) {
+    const scope = this.syncScope;
+    const state = this.syncState[scope] ?? (this.syncState[scope] = {});
+    if (state[path] === hash) return;
+    state[path] = hash;
+    this.syncStateDirty = true;
+  }
+
+  private async saveSyncState() {
+    if (!this.syncStateDirty) return;
+    const dir = '.obsidian/plugins/live-cursor/data';
+    await this.app.vault.adapter.mkdir(dir).catch(() => {});
+    await this.app.vault.adapter.write(`${dir}/sync-state.json`, JSON.stringify(this.syncState));
+    this.syncStateDirty = false;
+  }
+
+  private async removeLocalFile(path: string) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) await this.app.vault.delete(file);
+    else await this.app.vault.adapter.remove(path);
+  }
+
+  private async preserveConflict(path: string, data: ArrayBuffer, source: string) {
+    if (!path.endsWith('.md')) return;
+    const safeSource = source.replace(/[\\/:*?"<>|]/g, '-');
+    let conflictPath = this.getConflictPath(path, safeSource);
+    if (await this.app.vault.adapter.exists(conflictPath)) {
+      conflictPath = this.getConflictPath(path, `${safeSource} ${Date.now()}`);
+    }
+    await this.ensureDirExists(conflictPath, '');
+    await this.writeToVaultUI(conflictPath, data);
   }
 
   private getConflictPath(path: string, deviceName: string): string {
@@ -178,14 +240,16 @@ export class ConfigSyncEngine {
    * updates as needed, and resolving conflicts automatically.
    */
   public async syncConfig(silent: boolean = false) {
-    if (ConfigSyncEngine.isSyncing) {
+    if (this.isSyncing) {
+      this.syncPending = true;
       if (!silent) new Notice('Sync already in progress...');
       return;
     }
-    ConfigSyncEngine.isSyncing = true;
+    this.isSyncing = true;
     if (!silent) new Notice('Syncing vault files...', 2000);
 
     try {
+      await this.loadSyncState();
       const remoteManifest = await this.getRemoteManifest();
       const localFiles: { path: string, stat: any }[] = [];
 
@@ -225,149 +289,85 @@ export class ConfigSyncEngine {
         const local = localMap.get(relPath);
         const remote = remoteManifest[relPath];
 
+        // Active markdown files belong exclusively to their Yjs room. A
+        // tombstone is still handled so a remote deletion cannot be revived by
+        // an automatically reconnecting WebSocket client.
+        if (this.isLivePath(relPath) && !remote?.deleted) continue;
+
+        if (remote?.deleted) {
+          const deletedState = `!${remote.hash || ''}`;
+          if (local) {
+            const localData = await this.app.vault.adapter.readBinary(local.path);
+            const localHash = await this.hashData(localData);
+            const previousHash = this.getFileSyncState(relPath);
+            const alreadyObservedDeletion = previousHash?.startsWith('!');
+            const unchangedSinceSync = previousHash === localHash || localHash === remote.hash;
+            if (!alreadyObservedDeletion && (!remote.hash || unchangedSinceSync)) {
+              await this.removeLocalFile(local.path);
+              this.setFileSyncState(relPath, deletedState);
+            } else {
+              await this.uploadFile(relPath, localData, local.stat.mtime);
+              this.setFileSyncState(relPath, localHash);
+            }
+            actionsCount++;
+          } else {
+            this.setFileSyncState(relPath, deletedState);
+          }
+          continue;
+        }
+
         if (local && !remote) {
           // File exists only locally -> Upload
           const data = await this.app.vault.adapter.readBinary(local.path);
           await this.uploadFile(relPath, data, local.stat.mtime);
+          this.setFileSyncState(relPath, await this.hashData(data));
           actionsCount++;
         } else if (!local && remote) {
           // File exists only remotely -> Download
           await this.ensureDirExists(relPath, '');
           const data = await this.downloadFile(relPath);
           await this.writeToVaultUI(relPath, data);
+          this.setFileSyncState(relPath, remote.hash ?? await this.hashData(data));
           actionsCount++;
         } else if (local && remote) {
-          // File exists in both -> Check for modification differences
-          const timeDiff = Math.abs(local.stat.mtime - remote.mtime);
-          
-          if (timeDiff > 2000) {
-            // Contents or timestamps differ. Let's read both.
-            const localData = await this.app.vault.adapter.readBinary(local.path);
-            const remoteData = await this.downloadFile(relPath);
-
-            // Compare binary content quickly
-            const localBytes = new Uint8Array(localData);
-            const remoteBytes = new Uint8Array(remoteData);
-            let contentsMatch = localBytes.length === remoteBytes.length;
-            if (contentsMatch) {
-              for (let i = 0; i < localBytes.length; i++) {
-                if (localBytes[i] !== remoteBytes[i]) {
-                  contentsMatch = false;
-                  break;
-                }
-              }
-            }
-
-            if (contentsMatch) {
-              // Contents match exactly; just align the timestamps to the newest modified time
-              if (local.stat.mtime > remote.mtime) {
-                await this.uploadFile(relPath, localData, local.stat.mtime);
-              } else {
-                await this.writeToVaultUI(relPath, remoteData);
-              }
-            } else {
-              // Conflict: Contents are different and timestamps differ.
-              if (relPath.endsWith('.md')) {
-                // ELEGANT AUTOMATIC CRDT NOTE MERGE!
-                try {
-                  console.log(`[LiveCursor] Automatically merging CRDT conflict for note: ${relPath}`);
-                  
-                  // 1. Fetch the server's Yjs room state binary update
-                  const urlGet = `${this.getApiUrl('/room-state')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relPath)}`;
-                  const resGet = await requestUrl({ url: urlGet, method: 'GET' });
-                  
-                  const doc = new Y.Doc();
-                  if (resGet.status === 200 && resGet.arrayBuffer.byteLength > 0) {
-                    Y.applyUpdate(doc, new Uint8Array(resGet.arrayBuffer));
-                  }
-
-                  // 2. Read the local disk file content
-                  const decoder = new TextDecoder('utf-8');
-                  const localText = decoder.decode(new Uint8Array(localData));
-
-                  // 3. Reconcile the Yjs document with our local offline edits
-                  const ytext = doc.getText('content');
-                  
-                  // If the Yjs doc was empty, initialize it with the remote content first
-                  if (ytext.toString() === '') {
-                    const remoteText = decoder.decode(new Uint8Array(remoteData));
-                    ytext.insert(0, remoteText);
-                  }
-                  
-                  // Reconcile with local text to merge offline edits cleanly
-                  reconcileYText(ytext, localText);
-
-                  // 4. Encode the merged state as a Yjs update
-                  const mergedUpdate = Y.encodeStateAsUpdate(doc);
-
-                  // 5. Send the merged update back to the server
-                  const urlPost = `${this.getApiUrl('/room-state')}?user=${this.user}&pass=${this.pass}&workspace=${this.workspace}&path=${encodeURIComponent(relPath)}`;
-                  const resPost = await requestUrl({
-                    url: urlPost,
-                    method: 'POST',
-                    body: mergedUpdate.buffer,
-                  });
-
-                  if (resPost.status !== 200) throw new Error(`CRDT Merge POST failed: ${resPost.text}`);
-
-                  // 6. Write the merged text back to our local disk file
-                  const mergedText = ytext.toString();
-                  const encoder = new TextEncoder();
-                  await this.writeToVaultUI(relPath, encoder.encode(mergedText).buffer);
-
-                  actionsCount++;
-                  console.log(`[LiveCursor] CRDT merge successful for note: ${relPath}`);
-                } catch (crdtErr) {
-                  console.error(`[LiveCursor] CRDT merge failed for ${relPath}, falling back to silent mtime resolution:`, crdtErr);
-                  // Fallback: Silent latest modified wins (Zero Conflicts Protocol!)
-                  if (local.stat.mtime > remote.mtime) {
-                    await this.uploadFile(relPath, localData, local.stat.mtime);
-                  } else {
-                    await this.writeToVaultUI(relPath, remoteData);
-                  }
-                  actionsCount++;
-                }
-              } else if (relPath.endsWith('.json')) {
-                // Elegant automatic JSON merge
-                try {
-                  const decoder = new TextDecoder('utf-8');
-                  const encoder = new TextEncoder();
-
-                  const localJson = JSON.parse(decoder.decode(localBytes));
-                  const remoteJson = JSON.parse(decoder.decode(remoteBytes));
-
-                  const mergedJson = deepMerge(localJson, remoteJson);
-                  const mergedData = encoder.encode(JSON.stringify(mergedJson, null, 2)).buffer;
-                  
-                  const mergedMtime = Math.max(local.stat.mtime, remote.mtime);
-
-                  // Save merged file locally and upload to remote
-                  await this.writeToVaultUI(relPath, mergedData);
-                  await this.uploadFile(relPath, mergedData, mergedMtime);
-                  actionsCount++;
-                  console.log(`[LiveCursor] Automatically merged JSON conflict for config file: ${relPath}`);
-                } catch (jsonErr) {
-                  console.warn(`[LiveCursor] JSON merge failed for ${relPath}, falling back to silent mtime resolution:`, jsonErr);
-                  // Fallback: Silent latest modified wins (Zero Conflicts Protocol!)
-                  if (local.stat.mtime > remote.mtime) {
-                    await this.uploadFile(relPath, localData, local.stat.mtime);
-                  } else {
-                    await this.writeToVaultUI(relPath, remoteData);
-                  }
-                  actionsCount++;
-                }
-              } else {
-                // Non-JSON/Non-Markdown binary files: Resolve silently via latest modification time (mtime)
-                console.log(`[LiveCursor] Silently resolving binary conflict for ${relPath} via latest mtime`);
-                if (local.stat.mtime > remote.mtime) {
-                  await this.uploadFile(relPath, localData, local.stat.mtime);
-                } else {
-                  await this.writeToVaultUI(relPath, remoteData);
-                }
-                actionsCount++;
-              }
-            }
+          const localData = await this.app.vault.adapter.readBinary(local.path);
+          const localHash = await this.hashData(localData);
+          if (remote.hash === localHash) {
+            this.setFileSyncState(relPath, localHash);
+            continue;
           }
+
+          const remoteData = await this.downloadFile(relPath);
+          const remoteHash = remote.hash ?? await this.hashData(remoteData);
+          if (remoteHash === localHash) {
+            this.setFileSyncState(relPath, localHash);
+            continue;
+          }
+
+          const previousHash = this.getFileSyncState(relPath);
+          const localChanged = previousHash !== undefined && localHash !== previousHash;
+          const remoteChanged = previousHash !== undefined && remoteHash !== previousHash;
+
+          if (localChanged && !remoteChanged) {
+            await this.uploadFile(relPath, localData, local.stat.mtime);
+            this.setFileSyncState(relPath, localHash);
+          } else if (!localChanged && remoteChanged) {
+            await this.writeToVaultUI(relPath, remoteData);
+            this.setFileSyncState(relPath, remoteHash);
+          } else if (localChanged && remoteChanged) {
+            await this.preserveConflict(relPath, localData, this.deviceName);
+            await this.writeToVaultUI(relPath, remoteData);
+            this.setFileSyncState(relPath, remoteHash);
+          } else if (local.stat.mtime > remote.mtime) {
+            await this.preserveConflict(relPath, remoteData, 'Server');
+            await this.uploadFile(relPath, localData, local.stat.mtime);
+            this.setFileSyncState(relPath, localHash);
+          } else {
+            await this.preserveConflict(relPath, localData, this.deviceName);
+            await this.writeToVaultUI(relPath, remoteData);
+            this.setFileSyncState(relPath, remoteHash);
+          }
+          actionsCount++;
         }
       }
 
@@ -379,7 +379,14 @@ export class ConfigSyncEngine {
         new Notice(`Sync failed: ${errMsg}`, 5000);
       }
     } finally {
-      ConfigSyncEngine.isSyncing = false;
+      await this.saveSyncState().catch(error => {
+        console.error('[LiveCursor] Failed to save sync state:', error);
+      });
+      this.isSyncing = false;
+      if (this.syncPending) {
+        this.syncPending = false;
+        void this.syncConfig(true);
+      }
     }
   }
 }

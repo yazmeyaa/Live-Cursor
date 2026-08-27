@@ -8,6 +8,7 @@ yarn-error.log*
 dist/
 build/
 main.js
+server.bundle.js
 
 
 # Local databases and backups

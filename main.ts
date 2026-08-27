@@ -1,6 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, debounce, requestUrl } from 'obsidian';
 import * as Y from 'yjs';
-import * as diff from 'diff';
 import { Awareness } from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
 import { EditorView } from '@codemirror/view';
@@ -8,6 +7,7 @@ import { Compartment, StateEffect } from '@codemirror/state';
 import { collaborationExtension } from './collabExtension';
 import { reconcileYText } from './reconcile';
 import { ConfigSyncEngine } from './configSync';
+import { getFileRoomName } from './syncProtocol';
 
 // Electron/Node APIs — only available on desktop
 declare const require: (module: string) => any;
@@ -54,13 +54,12 @@ type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
 
 export default class LiveCursorPlugin extends Plugin {
   settings!: LiveCursorSettings;
-  public activeSyncs: Map<string, { doc: Y.Doc, awareness: Awareness, provider?: WebsocketProvider }> = new Map();
+  public activeSyncs: Map<string, { doc: Y.Doc, awareness: Awareness, provider: WebsocketProvider, initialized: boolean }> = new Map();
   private simulatorInterval: any = null;
   private statusBarItem: HTMLElement | null = null;
   private diskDebouncers: Map<string, (file: TFile) => void> = new Map();
   private connectionStatus: ConnectionStatus = 'disconnected';
   private serverProcess: any = null;
-  private retryTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private settingsTab: LiveCursorSettingTab | null = null;
   public configSyncEngine: ConfigSyncEngine | null = null;
 
@@ -77,7 +76,8 @@ export default class LiveCursorPlugin extends Plugin {
       this.settings.nickname, // Basic auth placeholder
       'default-pass',
       this.settings.roomName, // Using room name as workspace name
-      this.settings.nickname
+      this.settings.nickname,
+      (path) => this.activeSyncs.has(path)
     );
 
     // Start local server automatically on desktop if configured for localhost
@@ -121,7 +121,7 @@ export default class LiveCursorPlugin extends Plugin {
 
     this.addCommand({
       id: 'merge-conflicts',
-      name: 'Merge and Clean Up Conflict Files',
+      name: 'Clean Up Identical Conflict Files',
       callback: () => { this.cleanupAndMergeConflicts(); }
     });
 
@@ -152,10 +152,7 @@ export default class LiveCursorPlugin extends Plugin {
         for (const [path, sync] of this.activeSyncs.entries()) {
           if (!openPaths.has(path)) {
             console.log(`[LiveCursor] Cleaning up closed file: ${path}`);
-            const retryTimeout = this.retryTimeouts.get(path);
-            if (retryTimeout) clearTimeout(retryTimeout);
-            this.retryTimeouts.delete(path);
-            if (sync.provider) sync.provider.disconnect();
+            sync.provider.destroy();
             sync.doc.destroy();
             this.activeSyncs.delete(path);
             this.diskDebouncers.delete(path);
@@ -173,7 +170,7 @@ export default class LiveCursorPlugin extends Plugin {
           if (!debouncer) {
             debouncer = debounce(async (f: TFile) => {
               const sync = this.activeSyncs.get(f.path);
-              if (sync) {
+              if (sync?.initialized) {
                 const diskContent = await this.app.vault.read(f);
                 const currentYText = sync.doc.getText('content');
                 if (currentYText.toString() !== diskContent) {
@@ -205,12 +202,32 @@ export default class LiveCursorPlugin extends Plugin {
     );
     this.registerEvent(this.app.vault.on('create', () => backgroundSyncDebouncer()));
     this.registerEvent(this.app.vault.on('delete', (file) => {
-      if (this.configSyncEngine && file instanceof TFile) {
-        this.configSyncEngine.deleteRemoteFile(file.path);
+      if (file instanceof TFile) {
+        const sync = this.activeSyncs.get(file.path);
+        if (sync) {
+          this.detachEditorForFile(file.path);
+          sync.provider.destroy();
+          sync.doc.destroy();
+          this.activeSyncs.delete(file.path);
+          this.diskDebouncers.delete(file.path);
+        }
+        this.configSyncEngine?.deleteRemoteFile(file.path);
       }
       backgroundSyncDebouncer();
     }));
-    this.registerEvent(this.app.vault.on('rename', () => backgroundSyncDebouncer()));
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      const sync = this.activeSyncs.get(oldPath);
+      if (sync) {
+        this.detachEditorForFile(oldPath);
+        sync.provider.destroy();
+        sync.doc.destroy();
+        this.activeSyncs.delete(oldPath);
+        this.diskDebouncers.delete(oldPath);
+      }
+      this.configSyncEngine?.deleteRemoteFile(oldPath);
+      if (file instanceof TFile) this.syncFile(file);
+      backgroundSyncDebouncer();
+    }));
 
     // Automatically check for remote vault changes every 30 seconds
     this.registerInterval(window.setInterval(() => backgroundSyncDebouncer(), 30000));
@@ -220,6 +237,7 @@ export default class LiveCursorPlugin extends Plugin {
     if (activeView && activeView.file) {
       this.syncFile(activeView.file);
     }
+    void this.configSyncEngine.syncConfig(true);
   }
 
   // ─────────────────────────────────────────────
@@ -252,13 +270,17 @@ export default class LiveCursorPlugin extends Plugin {
     try {
       const { spawn } = require('child_process');
       const path = require('path');
+      const fs = require('fs');
 
       // Find the plugin folder — server.js lives alongside main.js
       const pluginDir = (this.app.vault.adapter as any).getBasePath
         ? path.join((this.app.vault.adapter as any).getBasePath(), '.obsidian', 'plugins', 'live-cursor')
         : (this.manifest as any).dir || '';
 
-      const serverPath = path.join(pluginDir, 'server.js');
+      const bundledServerPath = path.join(pluginDir, 'server.bundle.js');
+      const serverPath = fs.existsSync(bundledServerPath)
+        ? bundledServerPath
+        : path.join(pluginDir, 'server.js');
       console.log(`[LiveCursor] Starting server at: ${serverPath}`);
 
       this.serverProcess = spawn('node', [serverPath], {
@@ -293,6 +315,7 @@ export default class LiveCursorPlugin extends Plugin {
         if (!silent) new Notice('🟢 Local server started on port 4444. Connecting...');
         this.settingsTab?.display();
         this.reconnectAll();
+        void this.configSyncEngine?.syncConfig(true);
       }, 1500);
 
     } catch (err: any) {
@@ -301,15 +324,15 @@ export default class LiveCursorPlugin extends Plugin {
     }
   }
 
-  stopLocalServer(): void {
+  stopLocalServer(silent: boolean = false): void {
     if (!this.serverProcess) {
-      new Notice('No local server is running.');
+      if (!silent) new Notice('No local server is running.');
       return;
     }
     try {
       this.serverProcess.kill();
       this.serverProcess = null;
-      new Notice('⏹ Local server stopped.');
+      if (!silent) new Notice('⏹ Local server stopped.');
       this.settingsTab?.display();
       this.updateStatusBar();
     } catch (err: any) {
@@ -323,17 +346,14 @@ export default class LiveCursorPlugin extends Plugin {
   // ─────────────────────────────────────────────
 
   reconnectAll() {
-    // Clear all retry timers
-    for (const timeout of this.retryTimeouts.values()) clearTimeout(timeout);
-    this.retryTimeouts.clear();
-
     this.app.workspace.iterateAllLeaves((leaf) => {
       if (leaf.view instanceof MarkdownView && leaf.view.file) {
         const path = leaf.view.file.path;
         const sync = this.activeSyncs.get(path);
-        if (sync?.provider) {
-          sync.provider.disconnect();
+        if (sync) {
+          this.detachEditorForFile(path);
           sync.provider.destroy();
+          sync.doc.destroy();
         }
         // Remove from map to force re-create
         this.activeSyncs.delete(path);
@@ -354,18 +374,16 @@ export default class LiveCursorPlugin extends Plugin {
 
       // 1. Disconnect and clear all active docs locally
       for (const [path, sync] of this.activeSyncs.entries()) {
-        const retryTimeout = this.retryTimeouts.get(path);
-        if (retryTimeout) clearTimeout(retryTimeout);
-        this.retryTimeouts.delete(path);
-        if (sync.provider) sync.provider.disconnect();
+        sync.provider.destroy();
         sync.doc.destroy();
       }
       this.activeSyncs.clear();
       this.diskDebouncers.clear();
 
       // 2. Call reconstruct API on server
-      const url = `${this.configSyncEngine.serverUrl.trim()}/api/reconstruct-db?user=${this.settings.nickname}&workspace=${this.settings.roomName}`;
-      let httpUrl = url.replace(/^ws/i, 'http');
+      const serverUrl = normalizeServerUrl(this.configSyncEngine.serverUrl);
+      const httpUrl = `${serverUrl.replace(/^ws/i, 'http')}/api/reconstruct-db` +
+        `?user=${encodeURIComponent(this.settings.nickname)}&workspace=${encodeURIComponent(this.settings.roomName)}`;
       const res = await requestUrl({ url: httpUrl, method: 'POST' });
 
       if (res.status !== 200) {
@@ -389,7 +407,8 @@ export default class LiveCursorPlugin extends Plugin {
 
   async cleanupAndMergeConflicts() {
     const files = this.app.vault.getFiles();
-    let mergedCount = 0;
+    let cleanedCount = 0;
+    let unresolvedCount = 0;
 
     for (const file of files) {
       const match = file.name.match(/^(.*?) \(Conflict from .*\)\.md$/);
@@ -405,26 +424,20 @@ export default class LiveCursorPlugin extends Plugin {
           if (baseContent === conflictContent) {
             // Identical, just delete the conflict file
             await this.app.vault.trash(file, true);
-            mergedCount++;
+            cleanedCount++;
             continue;
           }
-
-          // Automatic CRDT-style additive merge (no git markers)
-          const diffs = diff.diffWordsWithSpace(baseContent, conflictContent);
-          let mergedContent = "";
-          for (const part of diffs) {
-            // Keep all text from both versions (CRDT union behavior)
-            mergedContent += part.value;
-          }
-
-          await this.app.vault.modify(baseFile, mergedContent);
-          await this.app.vault.trash(file, true);
-          mergedCount++;
+          // A conflict copy has no common CRDT base. Keep both versions for
+          // explicit review instead of silently concatenating incompatible text.
+          unresolvedCount++;
         }
       }
     }
 
-    new Notice(`✅ Merged and cleaned up ${mergedCount} conflict files!`);
+    new Notice(
+      `Cleaned ${cleanedCount} identical conflict files. ${unresolvedCount} divergent files kept for review.`,
+      5000
+    );
   }
 
   onunload() {
@@ -432,19 +445,13 @@ export default class LiveCursorPlugin extends Plugin {
       clearInterval(this.simulatorInterval);
       this.simulatorInterval = null;
     }
-    for (const timeout of this.retryTimeouts.values()) clearTimeout(timeout);
-    this.retryTimeouts.clear();
-
     for (const [, sync] of this.activeSyncs.entries()) {
-      if (sync.provider) {
-        sync.provider.disconnect();
-        sync.provider.destroy();
-      }
+      sync.provider.destroy();
       sync.doc.destroy();
     }
     this.activeSyncs.clear();
 
-    this.stopLocalServer();
+    this.stopLocalServer(true);
   }
 
   // ─────────────────────────────────────────────
@@ -453,13 +460,12 @@ export default class LiveCursorPlugin extends Plugin {
 
   private configureEditorForFile(file: TFile) {
     const sync = this.activeSyncs.get(file.path);
-    if (!sync) return;
+    if (!sync?.initialized) return;
 
     let retries = 0;
     const bind = () => {
-      let bound = false;
+      let boundCount = 0;
       this.app.workspace.iterateAllLeaves((leaf) => {
-        if (bound) return;
         if (leaf.view instanceof MarkdownView && leaf.view.file?.path === file.path) {
           const cm = (leaf.view.editor as any).cm as EditorView;
           if (!cm) return;
@@ -487,6 +493,16 @@ export default class LiveCursorPlugin extends Plugin {
 
           const ytext = sync.doc.getText('content');
 
+          // Detach a previous room before aligning the editor, otherwise the
+          // alignment itself is sent to the old Y.Doc during reconnect.
+          cm.dispatch({ effects: compartment.reconfigure([]) });
+          const sharedText = ytext.toString();
+          if (cm.state.doc.toString() !== sharedText) {
+            cm.dispatch({
+              changes: { from: 0, to: cm.state.doc.length, insert: sharedText }
+            });
+          }
+
           // collaborationExtension now wraps yCollab internally.
           // It passes both ytext and awareness so that yCollab can use
           // Y.RelativePosition for cursor tracking (the correct approach).
@@ -508,18 +524,62 @@ export default class LiveCursorPlugin extends Plugin {
           setTimeout(pingAwareness, 50);
           setTimeout(pingAwareness, 500); // Follow-up ping for reliability
 
-          bound = true;
+          boundCount++;
           console.log(`[LiveCursor] Editor bound for ${file.path}`);
         }
       });
-      if (!bound && retries < 20) {
+      if (boundCount === 0 && retries < 20) {
         retries++;
         setTimeout(bind, 100);
-      } else if (!bound) {
+      } else if (boundCount === 0) {
         console.warn(`[LiveCursor] Could not bind editor for ${file.path} after ${retries} retries`);
       }
     };
     bind();
+  }
+
+  private detachEditorForFile(path: string) {
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view instanceof MarkdownView && leaf.view.file?.path === path) {
+        const cm = (leaf.view.editor as any).cm as EditorView | undefined;
+        const compartment = (cm as any)?._liveCursorCompartment as Compartment | undefined;
+        if (cm && compartment) cm.dispatch({ effects: compartment.reconfigure([]) });
+      }
+    });
+  }
+
+  private async getCurrentFileContent(file: TFile): Promise<string> {
+    let editorContent: string | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (editorContent === null && leaf.view instanceof MarkdownView && leaf.view.file?.path === file.path) {
+        const cm = (leaf.view.editor as any).cm as EditorView | undefined;
+        if (cm) editorContent = cm.state.doc.toString();
+      }
+    });
+    return editorContent ?? await this.app.vault.read(file);
+  }
+
+  private async preserveLocalConflict(file: TFile, content: string) {
+    const normalized = file.path.replace(/\\/g, '/');
+    const slash = normalized.lastIndexOf('/');
+    const parent = slash === -1 ? '' : normalized.slice(0, slash);
+    const name = slash === -1 ? normalized : normalized.slice(slash + 1);
+    const dot = name.lastIndexOf('.');
+    const base = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const conflictDir = `Sync Conflicts/${parent}`.replace(/\/$/, '');
+    await this.app.vault.adapter.mkdir('Sync Conflicts').catch(() => {});
+    if (parent) {
+      let current = 'Sync Conflicts';
+      for (const part of parent.split('/')) {
+        current += `/${part}`;
+        await this.app.vault.adapter.mkdir(current).catch(() => {});
+      }
+    }
+    const conflictPath = `${conflictDir}/${base} (Local before sync ${stamp})${ext}`;
+    await this.app.vault.adapter.write(conflictPath, content);
+    new Notice(`Live Cursor preserved local edits in ${conflictPath}`, 6000);
   }
 
   // ─────────────────────────────────────────────
@@ -544,28 +604,48 @@ export default class LiveCursorPlugin extends Plugin {
       colorLight: this.settings.cursorColor + '33'
     });
 
-    const fileRoomName = `${this.settings.roomName}-${encodeURIComponent(file.path)}`;
+    const fileRoomName = getFileRoomName(this.settings.roomName, file.path);
     const serverUrl = normalizeServerUrl(this.settings.signalingUrl);
 
-    const provider = new WebsocketProvider(serverUrl, fileRoomName, doc, { awareness });
+    // Register all listeners before opening the socket so a fast local server
+    // cannot emit the initial sync event before we are ready.
+    const provider = new WebsocketProvider(serverUrl, fileRoomName, doc, {
+      awareness,
+      connect: false,
+      params: { workspace: this.settings.roomName, path: file.path }
+    });
 
-    const sync = { doc, awareness, provider };
+    const sync = { doc, awareness, provider, initialized: false };
     this.activeSyncs.set(file.path, sync);
     this.updateStatusBar();
 
-    // Prevent duplicate initializations and wait for WebSocket sync OR offline fallback
+    // Prevent duplicate initialization and wait for the authoritative server sync.
     let hasInitialized = false;
     const initializeCollab = async () => {
       if (hasInitialized) return;
       hasInitialized = true;
 
-      const currentLocalContent = await this.app.vault.read(file);
+      const currentLocalContent = await this.getCurrentFileContent(file);
+      if (this.activeSyncs.get(file.path) !== sync) return;
       if (ytext.toString() === '') {
         ytext.insert(0, currentLocalContent);
       } else if (ytext.toString() !== currentLocalContent) {
-        reconcileYText(ytext, currentLocalContent);
+        // A plain local file has no Yjs history, so pretending it is a CRDT
+        // update can overwrite newer remote edits. Preserve it and let the
+        // synchronized Y.Doc remain authoritative.
+        try {
+          await this.preserveLocalConflict(file, currentLocalContent);
+        } catch (error) {
+          console.error(`[LiveCursor] Failed to preserve local conflict for ${file.path}:`, error);
+          new Notice(`Live Cursor could not preserve local edits for ${file.path}`, 8000);
+          hasInitialized = false;
+          return;
+        }
+        await this.app.vault.modify(file, ytext.toString());
       }
 
+      if (this.activeSyncs.get(file.path) !== sync) return;
+      sync.initialized = true;
       this.configureEditorForFile(file);
 
       // Write remote changes back to disk if the file isn't open
@@ -592,10 +672,6 @@ export default class LiveCursorPlugin extends Plugin {
 
       if (status === 'connected') {
         this.connectionStatus = 'connected';
-        // Clear any pending retry for this file
-        const t = this.retryTimeouts.get(file.path);
-        if (t) { clearTimeout(t); this.retryTimeouts.delete(file.path); }
-        
         // Trigger background vault sync if not already syncing
         if (this.configSyncEngine) {
           this.configSyncEngine.syncConfig(true);
@@ -604,52 +680,10 @@ export default class LiveCursorPlugin extends Plugin {
         this.connectionStatus = 'connecting';
       } else if (status === 'disconnected') {
         this.connectionStatus = 'disconnected';
-        this.scheduleRetry(file, fileRoomName, doc, awareness, 0);
-        // If we fail to connect, initialize offline immediately
-        initializeCollab();
       }
       this.updateStatusBar();
     });
-  }
-
-  // ─────────────────────────────────────────────
-  // AUTO-RETRY WITH BACKOFF
-  // ─────────────────────────────────────────────
-
-  private scheduleRetry(file: TFile, roomName: string, doc: Y.Doc, awareness: Awareness, attempt: number) {
-    // Don't retry if file was closed
-    if (!this.activeSyncs.has(file.path)) return;
-
-    const MAX_ATTEMPTS = 5;
-    const DELAYS = [3000, 6000, 12000, 24000, 60000];
-
-    if (attempt >= MAX_ATTEMPTS) {
-      const url = normalizeServerUrl(this.settings.signalingUrl);
-      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
-      if (isLocal) {
-        new Notice(
-          '⚠️ Live Cursor: Cannot connect to local server.\n' +
-          'Go to Settings → Live Cursor → click "▶ Start Local Server".',
-          8000
-        );
-      } else {
-        new Notice(`⚠️ Live Cursor: Cannot connect to ${url}. Check the server is running.`, 8000);
-      }
-      return;
-    }
-
-    const delay = DELAYS[attempt] ?? 60000;
-    const t = setTimeout(() => {
-      const sync = this.activeSyncs.get(file.path);
-      if (!sync) return;
-
-      console.log(`[LiveCursor] Retry ${attempt + 1}/${MAX_ATTEMPTS} for ${file.path}`);
-      if (sync.provider) {
-        sync.provider.connect();
-      }
-    }, delay);
-
-    this.retryTimeouts.set(file.path, t);
+    provider.connect();
   }
 
   // ─────────────────────────────────────────────
