@@ -59,12 +59,28 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
   const filePath = 'Folder/Shared note.md';
   const room = `${encodeURIComponent(workspace)}--${encodeURIComponent(filePath)}`;
   const serverUrl = `ws://127.0.0.1:${port}`;
+  const apiUrl = `http://127.0.0.1:${port}/api`;
+  const protocol = '2';
+  const query = new URLSearchParams({ workspace, path: filePath, pass: sharedSecret, protocol });
+
+  const legacyProtocol = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}`);
+  assert.equal(legacyProtocol.status, 426);
+  const invalidPathQuery = new URLSearchParams({ workspace, path: 'folder/../private.md', pass: sharedSecret, protocol });
+  const invalidPath = await fetch(`${apiUrl}/upload?${invalidPathQuery}&baseRevision=0`, { method: 'POST', body: 'nope' });
+  assert.equal(invalidPath.status, 400);
+
+  const createResponse = await fetch(`${apiUrl}/upload?${query}&baseRevision=0&mtime=${Date.now()}`, {
+    method: 'POST',
+    body: ''
+  });
+  assert.equal(createResponse.status, 200);
+
   const makeProvider = doc => {
     const provider = new WebsocketProvider(serverUrl, room, doc, {
       connect: false,
       disableBc: true,
       WebSocketPolyfill: WebSocket,
-      params: { workspace, path: filePath, pass: sharedSecret }
+      params: { workspace, path: filePath, pass: sharedSecret, protocol }
     });
     providers.push(provider);
     return provider;
@@ -76,16 +92,15 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
 
   first.getText('content').insert(0, 'live update');
   await waitFor(() => second.getText('content').toString() === 'live update', 'WebSocket update did not reach peer');
-  await new Promise(resolve => setTimeout(resolve, 650));
 
-  const query = new URLSearchParams({ workspace, path: filePath, room, pass: sharedSecret });
-  const apiUrl = `http://127.0.0.1:${port}/api`;
-  assert.equal((await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}`)).status, 401);
+  assert.equal((await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&protocol=${protocol}`)).status, 401);
+  const liveManifest = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}&protocol=${protocol}`).then(response => response.json());
   const downloaded = await fetch(`${apiUrl}/download?${query}`).then(response => response.text());
   assert.equal(downloaded, 'live update');
 
   const replacement = 'uploaded while another client is live';
-  const uploadResponse = await fetch(`${apiUrl}/upload?${query}&mtime=${Date.now()}`, {
+  const beforeUpload = liveManifest;
+  const uploadResponse = await fetch(`${apiUrl}/upload?${query}&baseRevision=${beforeUpload[filePath].revision}&mtime=${Date.now()}`, {
     method: 'POST',
     body: replacement
   });
@@ -101,9 +116,35 @@ test('WebSocket, HTTP mirror, room state, and tombstones share one document', as
   Y.applyUpdate(restored, roomUpdate);
   assert.equal(restored.getText('content').toString(), replacement);
 
-  const deleteResponse = await fetch(`${apiUrl}/delete?${query}&user=test-device`, { method: 'DELETE' });
+  const uploaded = await uploadResponse.json();
+  const staleUpload = await fetch(`${apiUrl}/upload?${query}&baseRevision=${beforeUpload[filePath].revision}&mtime=${Date.now()}`, {
+    method: 'POST',
+    body: 'stale overwrite'
+  });
+  assert.equal(staleUpload.status, 409);
+
+  const deleteResponse = await fetch(`${apiUrl}/delete?${query}&baseRevision=${uploaded.revision}&user=test-device`, { method: 'DELETE' });
   assert.equal(deleteResponse.status, 200);
-  const manifest = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}`).then(response => response.json());
+  const manifest = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}&protocol=${protocol}`).then(response => response.json());
   assert.equal(manifest[filePath].deleted, true);
   assert.match(manifest[filePath].hash, /^[a-f0-9]{64}$/);
+
+  const resurrection = await fetch(`${apiUrl}/upload?${query}&baseRevision=0&mtime=${Date.now()}`, {
+    method: 'POST',
+    body: replacement
+  });
+  assert.equal(resurrection.status, 409);
+
+  const raceQuery = new URLSearchParams({ workspace, path: 'Race.md', pass: sharedSecret, protocol });
+  const competingCreates = await Promise.all(['first seed', 'second seed'].map(body =>
+    fetch(`${apiUrl}/upload?${raceQuery}&baseRevision=0&mtime=${Date.now()}`, { method: 'POST', body })
+  ));
+  assert.deepEqual(competingCreates.map(response => response.status).sort(), [200, 409]);
+  const raceContent = await fetch(`${apiUrl}/download?${raceQuery}`).then(response => response.text());
+  assert.ok(raceContent === 'first seed' || raceContent === 'second seed');
+
+  fs.unlinkSync(path.join(dbDir, 'config', 'team_room', 'Race.md'));
+  const afterExternalDelete = await fetch(`${apiUrl}/manifest?workspace=${encodeURIComponent(workspace)}&pass=${encodeURIComponent(sharedSecret)}&protocol=${protocol}`).then(response => response.json());
+  assert.equal(afterExternalDelete['Race.md'].deleted, true);
+  assert.ok(afterExternalDelete['Race.md'].revision > 1);
 });

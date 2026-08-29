@@ -10,6 +10,7 @@ const { setupWSConnection, docs: yWSdocs, getYDoc } = require('y-websocket/bin/u
 const port = process.env.PORT || 4444;
 const dbDir = process.env.DB_DIR || path.join(__dirname, 'data');
 const sharedSecret = process.env.LAPLAS_COWORK_SECRET || '';
+const protocolVersion = '2';
 
 if (!sharedSecret) {
   throw new Error('LAPLAS_COWORK_SECRET is required. Refusing to start an unauthenticated sync server.');
@@ -40,7 +41,9 @@ const roomMetadata = new Map();
 const initializedRooms = new Set();
 const hashCache = new Map();
 const tombstonesPath = path.join(dbDir, 'tombstones.json');
+const revisionsPath = path.join(dbDir, 'revisions.json');
 let tombstones = {};
+let revisions = {};
 
 try {
   if (fs.existsSync(tombstonesPath)) {
@@ -50,15 +53,82 @@ try {
   console.error('[Database] Failed to load tombstones:', error);
 }
 
+try {
+  if (fs.existsSync(revisionsPath)) {
+    revisions = JSON.parse(fs.readFileSync(revisionsPath, 'utf8'));
+  }
+} catch (error) {
+  console.error('[Database] Failed to load revisions:', error);
+}
+
 // Helper to get room path for persistence
 function getRoomPath(roomId) {
   const digest = crypto.createHash('sha256').update(roomId).digest('hex');
   return path.join(roomsDir, digest + '.bin');
 }
 
-function getLegacyRoomPath(roomId) {
-  const safeName = encodeURIComponent(roomId).replace(/%20/g, '_').slice(0, 100);
-  return path.join(roomsDir, safeName + '.bin');
+function saveRevisions() {
+  const tempPath = revisionsPath + '.tmp';
+  fs.writeFileSync(tempPath, JSON.stringify(revisions));
+  fs.renameSync(tempPath, revisionsPath);
+}
+
+function getWorkspaceRevisions(workspace) {
+  const key = workspace || 'default';
+  return revisions[key] || (revisions[key] = {});
+}
+
+function getFileRevision(workspace, filePath) {
+  return getWorkspaceRevisions(workspace)[filePath];
+}
+
+function recordFileRevision(workspace, filePath, hash, deleted, device, persist = true) {
+  const workspaceRevisions = getWorkspaceRevisions(workspace);
+  const previous = workspaceRevisions[filePath];
+  if (previous && previous.hash === hash && Boolean(previous.deleted) === Boolean(deleted)) return previous;
+  const next = {
+    hash: hash || previous?.hash || '',
+    revision: (previous?.revision || 0) + 1,
+    deleted: Boolean(deleted),
+    updatedAt: Date.now(),
+    device: device || 'Server'
+  };
+  workspaceRevisions[filePath] = next;
+  if (persist) saveRevisions();
+  return next;
+}
+
+function observeServerFile(workspace, filePath, fullPath, stat = fs.statSync(fullPath), persist = true) {
+  const hash = getFileHash(fullPath, stat);
+  const current = getFileRevision(workspace, filePath);
+  if (!current || current.hash !== hash || current.deleted) {
+    const observed = recordFileRevision(workspace, filePath, hash, false, 'Server', persist);
+    clearTombstone(workspace, filePath);
+    return observed;
+  }
+  return current;
+}
+
+function getCurrentRevision(workspace, filePath, fullPath) {
+  if (filePath.endsWith('.md')) {
+    const roomName = getRequestedRoom({ workspace, path: filePath });
+    const liveDoc = yWSdocs.get(roomName);
+    if (liveDoc) {
+      const liveHash = crypto.createHash('sha256').update(liveDoc.getText('content').toString()).digest('hex');
+      const current = getFileRevision(workspace, filePath);
+      if (!current || current.hash !== liveHash || current.deleted) {
+        return recordFileRevision(workspace, filePath, liveHash, false, 'Server');
+      }
+      return current;
+    }
+  }
+  if (fs.existsSync(fullPath)) return observeServerFile(workspace, filePath, fullPath);
+  const current = getFileRevision(workspace, filePath);
+  if (current) return current;
+  const tombstone = getWorkspaceTombstones(workspace)[filePath];
+  return tombstone
+    ? recordFileRevision(workspace, filePath, tombstone.hash, true, tombstone.device)
+    : undefined;
 }
 
 function getFileHash(filePath, stat = fs.statSync(filePath)) {
@@ -96,8 +166,12 @@ function clearTombstone(workspace, filePath) {
 
 function resolveWorkspaceFile(workspaceDir, relativePath) {
   if (!relativePath || path.isAbsolute(relativePath)) throw new Error('Invalid path');
-  const normalized = path.posix.normalize(relativePath.replace(/\\/g, '/'));
-  if (normalized === '..' || normalized.startsWith('../')) throw new Error('Invalid path');
+  const normalized = relativePath.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  if (
+    parts.some(part => !part || part === '.' || part === '..') ||
+    parts[0] === '.laplas-conflicts'
+  ) throw new Error('Invalid path');
   const fullPath = path.resolve(workspaceDir, normalized);
   const root = path.resolve(workspaceDir);
   if (fullPath !== root && !fullPath.startsWith(root + path.sep)) throw new Error('Invalid path');
@@ -105,16 +179,12 @@ function resolveWorkspaceFile(workspaceDir, relativePath) {
 }
 
 function getRequestedRoom(params) {
-  return params.room || `${encodeURIComponent(params.workspace || 'default')}--${encodeURIComponent((params.path || '').replace(/\\/g, '/'))}`;
+  return `${encodeURIComponent(params.workspace || 'default')}--${encodeURIComponent((params.path || '').replace(/\\/g, '/'))}`;
 }
 
 // Load document state from disk database
 function loadDoc(roomId, doc, metadata) {
   const candidates = [getRoomPath(roomId)];
-  if (metadata?.workspace && metadata?.path) {
-    candidates.push(getLegacyRoomPath(`/${metadata.workspace}-${metadata.path}`));
-    candidates.push(getLegacyRoomPath(`${metadata.workspace}-${encodeURIComponent(metadata.path)}`));
-  }
   const persistedPath = candidates.find(candidate => fs.existsSync(candidate));
   if (persistedPath) {
     try {
@@ -174,6 +244,7 @@ function persistRoom(roomName, doc) {
     fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
     fs.writeFileSync(mirrorPath, doc.getText('content').toString(), 'utf8');
     hashCache.delete(mirrorPath);
+    observeServerFile(metadata.workspace, metadata.path, mirrorPath);
     clearTombstone(metadata.workspace, metadata.path);
   } catch (error) {
     console.error(`[Database] Failed to update file mirror for room "${roomName}"`, error);
@@ -246,6 +317,11 @@ const server = http.createServer((req, res) => {
     return res.end('Unauthorized');
   }
 
+  if (urlObj.searchParams.get('protocol') !== protocolVersion) {
+    res.writeHead(426, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Unsupported sync protocol', protocol: protocolVersion }));
+  }
+
   console.log(`[HTTP] ${req.method} ${pathname}`);
 
   // --- GET /api/manifest ---
@@ -258,15 +334,25 @@ const server = http.createServer((req, res) => {
       const files = fs.readdirSync(dir);
       for (const file of files) {
         const fullPath = path.join(dir, file);
-        const stat = fs.statSync(fullPath);
+        let stat = fs.statSync(fullPath);
         if (stat.isDirectory()) {
           scanDir(fullPath);
         } else {
           const relPath = path.relative(wsDir, fullPath).replace(/\\/g, '/');
+          if (relPath.endsWith('.md')) {
+            const roomName = getRequestedRoom({ workspace: params.workspace, path: relPath });
+            const liveDoc = yWSdocs.get(roomName);
+            if (liveDoc) {
+              persistRoom(roomName, liveDoc);
+              stat = fs.statSync(fullPath);
+            }
+          }
+          const revision = observeServerFile(params.workspace, relPath, fullPath, stat, false);
           manifest[relPath] = {
             size: stat.size,
             mtime: stat.mtimeMs,
-            hash: getFileHash(fullPath, stat),
+            hash: revision.hash,
+            revision: revision.revision,
             device: 'Server'
           };
         }
@@ -275,17 +361,49 @@ const server = http.createServer((req, res) => {
     
     try {
       scanDir(wsDir);
+      for (const [relPath, storedRevision] of Object.entries(getWorkspaceRevisions(params.workspace))) {
+        if (manifest[relPath]) continue;
+        let deletedRevision = storedRevision;
+        if (!storedRevision.deleted) {
+          const tombstone = {
+            deletedAt: Date.now(),
+            hash: storedRevision.hash,
+            device: 'Server'
+          };
+          setTombstone(params.workspace, relPath, tombstone);
+          deletedRevision = recordFileRevision(params.workspace, relPath, storedRevision.hash, true, 'Server', false);
+          const roomName = getRequestedRoom({ workspace: params.workspace, path: relPath });
+          destroyRoom(roomName);
+          const roomPath = getRoomPath(roomName);
+          if (fs.existsSync(roomPath)) fs.unlinkSync(roomPath);
+        }
+        manifest[relPath] = {
+          size: 0,
+          mtime: deletedRevision.updatedAt,
+          hash: deletedRevision.hash,
+          revision: deletedRevision.revision,
+          deleted: true,
+          device: deletedRevision.device || 'Server'
+        };
+      }
       for (const [relPath, tombstone] of Object.entries(getWorkspaceTombstones(params.workspace))) {
         if (!manifest[relPath]) {
+          const revision = getCurrentRevision(
+            params.workspace,
+            relPath,
+            resolveWorkspaceFile(wsDir, relPath)
+          );
           manifest[relPath] = {
             size: 0,
             mtime: tombstone.deletedAt,
             hash: tombstone.hash,
+            revision: revision.revision,
             deleted: true,
             device: tombstone.device || 'Server'
           };
         }
       }
+      saveRevisions();
       console.log(`[HTTP] 200 OK /api/manifest - Scanned ${Object.keys(manifest).length} files for workspace: ${params.workspace}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(manifest));
@@ -302,8 +420,9 @@ const server = http.createServer((req, res) => {
     const params = getQueryParams(req.url);
     const wsDir = getConfigWorkspacePath(params.workspace);
     const relPath = params.path;
+    const baseRevision = Number(params.baseRevision);
     
-    if (!relPath) {
+    if (!relPath || !Number.isInteger(baseRevision) || baseRevision < 0) {
       console.warn(`[HTTP] 400 Bad Request /api/upload - Invalid path: ${relPath}`);
       res.writeHead(400);
       return res.end('Invalid path');
@@ -327,9 +446,17 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       const buffer = Buffer.concat(chunks);
       try {
+        const current = getCurrentRevision(params.workspace, relPath, fullPath);
+        const currentRevision = current?.revision || 0;
+        if (currentRevision !== baseRevision) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'Revision conflict', current }));
+        }
         fs.writeFileSync(fullPath, buffer);
         hashCache.delete(fullPath);
         clearTombstone(params.workspace, relPath);
+        const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+        const revision = recordFileRevision(params.workspace, relPath, hash, false, params.user);
 
         // Set the file's mtime to what the client sent, if provided
         if (params.mtime) {
@@ -351,8 +478,8 @@ const server = http.createServer((req, res) => {
         }
 
         console.log(`[HTTP] 200 OK /api/upload - Path: ${relPath} for workspace: ${params.workspace}`);
-        res.writeHead(200);
-        res.end('Uploaded');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ hash: revision.hash, revision: revision.revision }));
       } catch (err) {
         console.error(`[HTTP] 500 Error /api/upload:`, err);
         res.writeHead(500);
@@ -397,8 +524,9 @@ const server = http.createServer((req, res) => {
     const params = getQueryParams(req.url);
     const wsDir = getConfigWorkspacePath(params.workspace);
     const relPath = params.path;
+    const baseRevision = Number(params.baseRevision);
     
-    if (!relPath) {
+    if (!relPath || !Number.isInteger(baseRevision) || baseRevision < 1) {
       console.warn(`[HTTP] 400 Bad Request /api/delete - Invalid path: ${relPath}`);
       res.writeHead(400);
       return res.end('Invalid path');
@@ -413,12 +541,14 @@ const server = http.createServer((req, res) => {
     }
     console.log(`[HTTP] DELETE /api/delete?user=${params.user}&workspace=${params.workspace}&path=${encodeURIComponent(relPath)} - Request received`);
 
+    const current = getCurrentRevision(params.workspace, relPath, fullPath);
+    if (!current || current.revision !== baseRevision || current.deleted) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Revision conflict', current }));
+    }
+
     const roomName = getRequestedRoom(params);
-    const roomPaths = [
-      getRoomPath(roomName),
-      getLegacyRoomPath(`/${params.workspace}-${relPath}`),
-      getLegacyRoomPath(`${params.workspace}-${encodeURIComponent(relPath)}`)
-    ];
+    const roomPaths = [getRoomPath(roomName)];
 
     let deletedHash = getWorkspaceTombstones(params.workspace)[relPath]?.hash;
     if (fs.existsSync(fullPath)) {
@@ -429,6 +559,13 @@ const server = http.createServer((req, res) => {
       hash: deletedHash,
       device: params.user || 'Unknown Device'
     });
+    const deletedRevision = recordFileRevision(
+      params.workspace,
+      relPath,
+      deletedHash,
+      true,
+      params.user || 'Unknown Device'
+    );
 
     destroyRoom(roomName);
 
@@ -448,8 +585,8 @@ const server = http.createServer((req, res) => {
         fs.unlinkSync(fullPath);
         hashCache.delete(fullPath);
         console.log(`[HTTP] 200 OK /api/delete - Path: ${relPath} for workspace: ${params.workspace}`);
-        res.writeHead(200);
-        res.end('Deleted');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ hash: deletedRevision.hash, revision: deletedRevision.revision, deleted: true }));
       } catch (e) {
         console.error(`[HTTP] 500 Error /api/delete: ${e.message}`);
         res.writeHead(500);
@@ -457,8 +594,8 @@ const server = http.createServer((req, res) => {
       }
     } else {
       console.log(`[HTTP] 200 OK /api/delete (Already missing) - Path: ${relPath}`);
-      res.writeHead(200);
-      res.end('Already deleted');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ hash: deletedRevision.hash, revision: deletedRevision.revision, deleted: true }));
     }
     return;
   }
@@ -484,96 +621,8 @@ const server = http.createServer((req, res) => {
 
   // --- POST /api/room-state ---
   if (pathname === '/api/room-state' && req.method === 'POST') {
-    const params = getQueryParams(req.url);
-    const wsDir = getConfigWorkspacePath(params.workspace);
-    const relPath = params.path;
-    
-    if (!relPath) {
-      console.warn(`[HTTP] 400 Bad Request /api/room-state - Invalid path: ${relPath}`);
-      res.writeHead(400);
-      return res.end('Invalid path');
-    }
-
-    const roomName = getRequestedRoom(params);
-    console.log(`[HTTP] POST /api/room-state - Path: ${relPath} for workspace: ${params.workspace}`);
-
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-      const update = Buffer.concat(chunks);
-      
-      const doc = getPersistentDoc(roomName, { workspace: params.workspace, path: relPath });
-
-      try {
-        Y.applyUpdate(doc, new Uint8Array(update));
-        persistRoom(roomName, doc);
-
-        // Retrieve text
-        const mergedText = doc.getText('content').toString();
-
-        // Also write plain text file to configuration folder so they are synced side-by-side
-        const fullPath = resolveWorkspaceFile(wsDir, relPath);
-        const targetDir = path.dirname(fullPath);
-        if (!fs.existsSync(targetDir)) {
-          fs.mkdirSync(targetDir, { recursive: true });
-        }
-        fs.writeFileSync(fullPath, mergedText, 'utf-8');
-        hashCache.delete(fullPath);
-        clearTombstone(params.workspace, relPath);
-
-        console.log(`[HTTP] 200 OK /api/room-state - Successfully merged CRDT for path: ${relPath}`);
-        res.writeHead(200);
-        res.end('Merged');
-      } catch (err) {
-        console.error(`[HTTP] 500 Error /api/room-state:`, err);
-        res.writeHead(500);
-        res.end(`Merge failed: ${err.message}`);
-      }
-    });
-    return;
-  }
-
-  // --- POST /api/reconstruct-db ---
-  if (pathname === '/api/reconstruct-db' && req.method === 'POST') {
-    const params = getQueryParams(req.url);
-    console.log(`[HTTP] POST /api/reconstruct-db?user=${params.user}&workspace=${params.workspace} - Reconstructing Database...`);
-
-    try {
-      // 1. Clear all active docs in memory
-      for (const roomName of Array.from(yWSdocs.keys())) destroyRoom(roomName);
-
-      // Clear any pending timeouts
-      for (const timeout of saveTimeouts.values()) {
-        try {
-          clearTimeout(timeout);
-        } catch (e) {}
-      }
-      saveTimeouts.clear();
-
-      // 2. Delete all room binary files on disk
-      if (fs.existsSync(roomsDir)) {
-        const files = fs.readdirSync(roomsDir);
-        for (const file of files) {
-          if (file.endsWith('.bin')) {
-            try {
-              fs.unlinkSync(path.join(roomsDir, file));
-            } catch (e) {
-              console.warn(`[Database] Failed to delete file ${file}:`, e);
-            }
-          }
-        }
-        console.log('[Database] Cleared all room binary files.');
-      }
-      tombstones = {};
-      saveTombstones();
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Database room state cleared. Server memory reset.' }));
-    } catch (e) {
-      console.error(`[HTTP] 500 Error /api/reconstruct-db: ${e.message}`);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: false, error: e.message }));
-    }
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Snapshot CRDT merging was removed; use revisioned file sync or WebSocket updates.' }));
     return;
   }
 
@@ -608,10 +657,34 @@ server.on('upgrade', (request, socket, head) => {
     socket.destroy();
     return;
   }
+  if (url.searchParams.get('protocol') !== protocolVersion) {
+    socket.write('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   const workspace = url.searchParams.get('workspace') || 'default';
   const filePath = url.searchParams.get('path') || '';
+  const roomName = url.pathname.replace(/^\/+/, '');
+  if (!filePath || roomName !== getRequestedRoom({ workspace, path: filePath })) {
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   if (filePath && getWorkspaceTombstones(workspace)[filePath]) {
     socket.write('HTTP/1.1 410 Gone\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  try {
+    const workspaceDir = getConfigWorkspacePath(workspace);
+    const mirrorPath = resolveWorkspaceFile(workspaceDir, filePath);
+    if (!fs.existsSync(mirrorPath)) {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+  } catch {
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -625,7 +698,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log('===================================================');
   console.log('       LAPLAS COWORK PRIVATE SYNC SERVER             ');
   console.log('===================================================');
-  console.log(`[*] Version: 2.0.1`);
+  console.log(`[*] Version: 2.1.0`);
   console.log(`[*] Mode: Self-hosted`);
   console.log(`[*] Port: ${actualPort}`);
   console.log(`[*] Database Directory: ${dbDir}`);

@@ -7,7 +7,7 @@ This repository is an independently maintained fork of the original Live Cursor 
 ## Features
 
 - Real-time collaborative editing and cursor presence for open Markdown notes.
-- Hash-based background synchronization for closed notes and other vault files.
+- Revisioned background synchronization inside one isolated room folder.
 - Conflict copies when both local and remote content changed.
 - Deletion tombstones that prevent unchanged files from reappearing.
 - One-click local server on desktop; mobile devices can connect as clients.
@@ -21,7 +21,12 @@ Windows users can follow the detailed [Windows installation guide](WINDOWS_INSTA
 2. On the desktop that will host synchronization, keep the default `ws://localhost:4444` URL and start the local server.
 3. Open the plugin settings and copy the room name and generated shared secret to every other device.
 4. On other devices, set the server URL to the host address, for example `ws://192.168.1.12:4444`.
-5. Open the same Markdown note on multiple devices.
+5. Work inside the configured room folder. By default it is `<room-name>[laplas_cowork]`.
+6. Open the same Markdown note on multiple devices.
+
+Laplas Cowork never synchronizes files outside its configured room folder. A device joining an existing room is pull-first: pre-existing local files are kept unpublished until **Publish Local Files** is explicitly selected in settings.
+
+Version 2.1 uses a revisioned sync protocol. Upgrade the server host and all clients together; older clients are rejected instead of being allowed to write without revision checks.
 
 The desktop host must remain running. Mobile devices can join a server but cannot host one.
 
@@ -33,7 +38,7 @@ The desktop host starts a bundled Node.js child process, listens on `0.0.0.0:444
 
 Use `wss://` through a trusted TLS reverse proxy when traffic crosses an untrusted network. The shared secret controls access, but vault contents are not end-to-end encrypted by this plugin. Anyone who obtains both the server address and shared secret can read or change synchronized data.
 
-The background synchronizer excludes `.git`, `.trash`, `node_modules`, installed plugin directories, device-specific workspace state, and its conflict directory. Review conflict copies before deleting them.
+Conflict copies are kept under `.laplas-conflicts` inside the room folder. Server revisions reject stale uploads, and server tombstones cannot be implicitly overwritten by a newly connected device.
 
 ## External server
 

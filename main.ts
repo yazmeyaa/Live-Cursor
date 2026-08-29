@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, Platform, debounce, requestUrl } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, Platform, debounce } from 'obsidian';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
@@ -7,7 +7,7 @@ import { Compartment, StateEffect } from '@codemirror/state';
 import { collaborationExtension } from './collabExtension';
 import { reconcileYText } from './reconcile';
 import { ConfigSyncEngine } from './configSync';
-import { decideSyncAction, getFileRoomName, normalizeServerUrl } from './syncProtocol';
+import { getDefaultSyncFolder, getFileRoomName, normalizeServerUrl, normalizeSyncFolder, SYNC_PROTOCOL_VERSION } from './syncProtocol';
 import embeddedServerSource from './server.js?embedded';
 
 // Electron/Node APIs — only available on desktop
@@ -21,6 +21,7 @@ interface LaplasCoworkSettings {
   roomName: string;
   signalingUrl: string;
   sharedSecret: string;
+  syncFolder: string;
 }
 
 const DEFAULT_SETTINGS: LaplasCoworkSettings = {
@@ -28,7 +29,8 @@ const DEFAULT_SETTINGS: LaplasCoworkSettings = {
   cursorColor: '#6366f1',
   roomName: 'default-laplas-cowork-room',
   signalingUrl: 'ws://localhost:4444',
-  sharedSecret: ''
+  sharedSecret: '',
+  syncFolder: '',
 }
 
 type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
@@ -42,6 +44,7 @@ export default class LaplasCoworkPlugin extends Plugin {
   private connectionStatus: ConnectionStatus = 'disconnected';
   private serverProcess: any = null;
   private settingsTab: LaplasCoworkSettingTab | null = null;
+  private unpublishedNotices = new Set<string>();
   public configSyncEngine: ConfigSyncEngine | null = null;
 
   async onload() {
@@ -58,6 +61,7 @@ export default class LaplasCoworkPlugin extends Plugin {
       this.settings.sharedSecret,
       this.settings.roomName, // Using room name as workspace name
       this.settings.nickname,
+      this.settings.syncFolder,
       (path) => this.activeSyncs.has(path),
       `${this.app.vault.configDir}/plugins/${this.manifest.id}/data`
     );
@@ -115,7 +119,7 @@ export default class LaplasCoworkPlugin extends Plugin {
         if (!leaf) return;
         const view = leaf.view;
         if (view instanceof MarkdownView && view.file) {
-          this.syncFile(view.file);
+          void this.syncFile(view.file);
         }
       })
     );
@@ -145,7 +149,7 @@ export default class LaplasCoworkPlugin extends Plugin {
     // Sync disk changes back into Yjs
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
-        if (file instanceof TFile) {
+        if (file instanceof TFile && this.isManagedPath(file.path)) {
           let debouncer = this.diskDebouncers.get(file.path);
           if (!debouncer) {
             debouncer = debounce(async (f: TFile) => {
@@ -175,12 +179,14 @@ export default class LaplasCoworkPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
         // If it's not currently open, sync it in the background
-        if (file instanceof TFile && !this.activeSyncs.has(file.path)) {
+        if (file instanceof TFile && this.isManagedPath(file.path) && !this.activeSyncs.has(file.path)) {
           backgroundSyncDebouncer();
         }
       })
     );
-    this.registerEvent(this.app.vault.on('create', () => backgroundSyncDebouncer()));
+    this.registerEvent(this.app.vault.on('create', (file) => {
+      if (file instanceof TFile && this.isManagedPath(file.path)) backgroundSyncDebouncer();
+    }));
     this.registerEvent(this.app.vault.on('delete', (file) => {
       if (file instanceof TFile) {
         const sync = this.activeSyncs.get(file.path);
@@ -191,9 +197,9 @@ export default class LaplasCoworkPlugin extends Plugin {
           this.activeSyncs.delete(file.path);
           this.diskDebouncers.delete(file.path);
         }
-        this.configSyncEngine?.deleteRemoteFile(file.path);
+        void this.configSyncEngine?.deleteRemoteFile(file.path);
       }
-      backgroundSyncDebouncer();
+      if (file instanceof TFile && this.isManagedPath(file.path)) backgroundSyncDebouncer();
     }));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
       const sync = this.activeSyncs.get(oldPath);
@@ -204,9 +210,9 @@ export default class LaplasCoworkPlugin extends Plugin {
         this.activeSyncs.delete(oldPath);
         this.diskDebouncers.delete(oldPath);
       }
-      this.configSyncEngine?.deleteRemoteFile(oldPath);
-      if (file instanceof TFile) this.syncFile(file);
-      backgroundSyncDebouncer();
+      void this.configSyncEngine?.deleteRemoteFile(oldPath);
+      if (file instanceof TFile && this.isManagedPath(file.path)) void this.syncFile(file);
+      if (this.isManagedPath(oldPath) || (file instanceof TFile && this.isManagedPath(file.path))) backgroundSyncDebouncer();
     }));
 
     // Automatically check for remote vault changes every 30 seconds
@@ -215,7 +221,7 @@ export default class LaplasCoworkPlugin extends Plugin {
     // Sync the currently active file
     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (activeView && activeView.file) {
-      this.syncFile(activeView.file);
+      void this.syncFile(activeView.file);
     }
     void this.configSyncEngine.syncConfig(true);
   }
@@ -226,6 +232,10 @@ export default class LaplasCoworkPlugin extends Plugin {
 
   isDesktop(): boolean {
     return Platform.isDesktopApp;
+  }
+
+  isManagedPath(path: string): boolean {
+    return this.configSyncEngine?.getRemotePath(path) !== undefined;
   }
 
   isServerRunning(): boolean {
@@ -341,54 +351,10 @@ export default class LaplasCoworkPlugin extends Plugin {
         }
         // Remove from map to force re-create
         this.activeSyncs.delete(path);
-        this.syncFile(leaf.view.file);
+        void this.syncFile(leaf.view.file);
       }
     });
     this.updateStatusBar();
-  }
-
-  async reconstructDatabase(): Promise<void> {
-    if (!this.configSyncEngine) {
-      new Notice('Sync engine not initialized.');
-      return;
-    }
-
-    try {
-      new Notice('🔄 Resetting and reconstructing server database rooms...', 3000);
-
-      // 1. Disconnect and clear all active docs locally
-      for (const [path, sync] of this.activeSyncs.entries()) {
-        sync.provider.destroy();
-        sync.doc.destroy();
-      }
-      this.activeSyncs.clear();
-      this.diskDebouncers.clear();
-
-      // 2. Call reconstruct API on server
-      const serverUrl = normalizeServerUrl(this.configSyncEngine.serverUrl);
-      const httpUrl = `${serverUrl.replace(/^ws/i, 'http')}/api/reconstruct-db` +
-        `?user=${encodeURIComponent(this.settings.nickname)}` +
-        `&pass=${encodeURIComponent(this.settings.sharedSecret)}` +
-        `&workspace=${encodeURIComponent(this.settings.roomName)}`;
-      const res = await requestUrl({ url: httpUrl, method: 'POST' });
-
-      if (res.status !== 200) {
-        throw new Error(`Server returned HTTP ${res.status}: ${res.text || 'No response body'}`);
-      }
-
-      new Notice('🧹 Server memory cleared. Re-uploading all files as source of truth...', 3500);
-
-      // 3. Force full vault config and note re-upload!
-      await this.configSyncEngine.syncConfig(false);
-
-      // 4. Reconnect active workspace leaves
-      this.reconnectAll();
-
-      new Notice('✅ Database successfully reconstructed! All devices connected.', 4000);
-    } catch (err: any) {
-      console.error('[LaplasCowork] Database reconstruction failed:', err);
-      new Notice(`❌ Database reconstruction failed: ${err.message || err}`, 5000);
-    }
   }
 
   async cleanupAndMergeConflicts() {
@@ -397,6 +363,7 @@ export default class LaplasCoworkPlugin extends Plugin {
     let unresolvedCount = 0;
 
     for (const file of files) {
+      if (!this.isManagedPath(file.path)) continue;
       const match = file.name.match(/^(.*?) \(Conflict from .*\)\.md$/);
       if (match) {
         const baseName = match[1] + '.md';
@@ -539,17 +506,22 @@ export default class LaplasCoworkPlugin extends Plugin {
   }
 
   private async preserveLocalConflict(file: TFile, content: string, hash: string) {
-    const normalized = file.path.replace(/\\/g, '/');
+    const syncEngine = this.configSyncEngine;
+    const remotePath = syncEngine?.getRemotePath(file.path);
+    if (!syncEngine || !remotePath) return;
+    const normalized = remotePath.replace(/\\/g, '/');
     const slash = normalized.lastIndexOf('/');
     const parent = slash === -1 ? '' : normalized.slice(0, slash);
     const name = slash === -1 ? normalized : normalized.slice(slash + 1);
     const dot = name.lastIndexOf('.');
     const base = dot > 0 ? name.slice(0, dot) : name;
     const ext = dot > 0 ? name.slice(dot) : '';
-    const conflictDir = `Sync Conflicts/${parent}`.replace(/\/$/, '');
-    await this.app.vault.adapter.mkdir('Sync Conflicts').catch(() => {});
+    const conflictRoot = `${syncEngine.folder}/.laplas-conflicts`;
+    const conflictDir = `${conflictRoot}/${parent}`.replace(/\/$/, '');
+    await this.app.vault.adapter.mkdir(syncEngine.folder).catch(() => {});
+    await this.app.vault.adapter.mkdir(conflictRoot).catch(() => {});
     if (parent) {
-      let current = 'Sync Conflicts';
+      let current = conflictRoot;
       for (const part of parent.split('/')) {
         current += `/${part}`;
         await this.app.vault.adapter.mkdir(current).catch(() => {});
@@ -573,11 +545,28 @@ export default class LaplasCoworkPlugin extends Plugin {
   // ─────────────────────────────────────────────
 
   private async syncFile(file: TFile) {
+    const syncEngine = this.configSyncEngine;
+    const remotePath = syncEngine?.getRemotePath(file.path);
+    if (!syncEngine || !remotePath || !file.path.endsWith('.md')) return;
+
     if (this.activeSyncs.has(file.path)) {
       this.configureEditorForFile(file);
       this.updateStatusBar();
       return;
     }
+
+    // Closed-file synchronization performs the only snapshot upload. The
+    // WebSocket client connects only after the server has a canonical file.
+    if (!await syncEngine.syncConfig(true)) return;
+    if (!await syncEngine.canCollaborate(file.path)) {
+      if (!this.unpublishedNotices.has(file.path)) {
+        this.unpublishedNotices.add(file.path);
+        new Notice(`${file.path} is local-only. Publish existing local files from Laplas Cowork settings to collaborate.`, 6000);
+      }
+      return;
+    }
+    this.unpublishedNotices.delete(file.path);
+    if (this.activeSyncs.has(file.path)) return;
 
     const doc = new Y.Doc();
     const ytext = doc.getText('content');
@@ -589,7 +578,7 @@ export default class LaplasCoworkPlugin extends Plugin {
       colorLight: this.settings.cursorColor + '33'
     });
 
-    const fileRoomName = getFileRoomName(this.settings.roomName, file.path);
+    const fileRoomName = getFileRoomName(this.settings.roomName, remotePath);
     const serverUrl = normalizeServerUrl(this.settings.signalingUrl);
 
     // Register all listeners before opening the socket so a fast local server
@@ -599,8 +588,9 @@ export default class LaplasCoworkPlugin extends Plugin {
       connect: false,
       params: {
         workspace: this.settings.roomName,
-        path: file.path,
-        pass: this.settings.sharedSecret
+        path: remotePath,
+        pass: this.settings.sharedSecret,
+        protocol: SYNC_PROTOCOL_VERSION,
       }
     });
 
@@ -617,29 +607,14 @@ export default class LaplasCoworkPlugin extends Plugin {
       const currentLocalContent = await this.getCurrentFileContent(file);
       if (this.activeSyncs.get(file.path) !== sync) return;
       const remoteContent = ytext.toString();
-      const syncEngine = this.configSyncEngine;
-      if (!syncEngine) return;
 
-      const [localHash, remoteHash, baseHash] = await Promise.all([
+      const [localHash, remoteHash] = await Promise.all([
         syncEngine.hashText(currentLocalContent),
         syncEngine.hashText(remoteContent),
-        syncEngine.getLastSyncedHash(file.path)
       ]);
       if (this.activeSyncs.get(file.path) !== sync) return;
 
-      let decision = decideSyncAction(baseHash, localHash, remoteHash);
-      // An empty room without a baseline is new, so seed it from the local file.
-      if (decision === 'bootstrap' && remoteContent === '') decision = 'upload';
-
-      let syncedHash: string | undefined = remoteHash;
-      if (decision === 'upload') {
-        reconcileYText(ytext, currentLocalContent);
-        // y-websocket has no per-update acknowledgement. Keep the previous
-        // baseline until a later equality check confirms the server received it.
-        syncedHash = undefined;
-      } else if (decision === 'download') {
-        await this.app.vault.modify(file, remoteContent);
-      } else if (decision === 'conflict' || decision === 'bootstrap') {
+      if (localHash !== remoteHash) {
         try {
           await this.preserveLocalConflict(file, currentLocalContent, localHash);
         } catch (error) {
@@ -651,11 +626,9 @@ export default class LaplasCoworkPlugin extends Plugin {
         await this.app.vault.modify(file, remoteContent);
       }
 
-      if (syncedHash !== undefined) {
-        await syncEngine.recordSyncedHash(file.path, syncedHash).catch(error => {
-          console.warn(`[LaplasCowork] Could not record sync state for ${file.path}:`, error);
-        });
-      }
+      await syncEngine.recordSyncedHash(file.path, remoteHash).catch(error => {
+        console.warn(`[LaplasCowork] Could not record sync state for ${file.path}:`, error);
+      });
 
       if (this.activeSyncs.get(file.path) !== sync) return;
       sync.initialized = true;
@@ -842,7 +815,7 @@ class LaplasCoworkSettingTab extends PluginSettingTab {
     header.style.marginBottom = '24px';
     const title = header.createEl('h2', { text: 'Laplas Cowork Settings' });
     title.style.margin = '0 0 6px 0';
-    const subtitle = header.createEl('p', { text: 'Real-time collaborative editing for your Obsidian vault.' });
+    const subtitle = header.createEl('p', { text: 'Real-time collaboration inside an isolated room folder.' });
     subtitle.style.margin = '0';
     subtitle.style.fontSize = 'var(--font-ui-small)';
     subtitle.style.color = 'var(--text-muted)';
@@ -856,7 +829,7 @@ class LaplasCoworkSettingTab extends PluginSettingTab {
     steps.createEl('li', { text: 'On a desktop, start the local server.' });
     steps.createEl('li', { text: 'On other devices, enter the host address, for example ws://192.168.1.12:4444.' });
     steps.createEl('li', { text: 'Copy the room name and shared secret exactly.' });
-    steps.createEl('li', { text: 'Open the same note on each device.' });
+    steps.createEl('li', { text: 'Work only inside the configured Laplas Cowork folder.' });
 
     // ── Section: Profile ──
     containerEl.createEl('h3', { text: '👤 Your Profile', attr: { style: sectionHeaderStyle() } });
@@ -972,43 +945,85 @@ class LaplasCoworkSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Room Name')
       .setDesc('All devices must use the exact same room name to collaborate together.')
-      .addText(text => text
-        .setPlaceholder('default-laplas-cowork-room')
-        .setValue(this.plugin.settings.roomName)
-        .onChange(async (val) => {
-          this.plugin.settings.roomName = val || 'default-laplas-cowork-room';
-          if (this.plugin.configSyncEngine) {
-            this.plugin.configSyncEngine.workspace = this.plugin.settings.roomName;
-          }
-          await this.plugin.saveSettings();
-        }));
+      .addText(text => {
+        let applyTimeout: number | undefined;
+        return text
+          .setPlaceholder('default-laplas-cowork-room')
+          .setValue(this.plugin.settings.roomName)
+          .onChange((val) => {
+            if (applyTimeout !== undefined) window.clearTimeout(applyTimeout);
+            applyTimeout = window.setTimeout(async () => {
+              const engine = this.plugin.configSyncEngine;
+              if (engine) await engine.syncConfig(true);
+              this.plugin.settings.roomName = val || 'default-laplas-cowork-room';
+              if (engine) engine.workspace = this.plugin.settings.roomName;
+              await this.plugin.saveSettings();
+              this.plugin.reconnectAll();
+            }, 750);
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Room Folder')
+      .setDesc('Only this folder is synchronized. Files elsewhere in your vault are never uploaded, replaced, or deleted by Laplas Cowork.')
+      .addText(text => {
+        let applyTimeout: number | undefined;
+        return text
+          .setPlaceholder(getDefaultSyncFolder(this.plugin.settings.roomName))
+          .setValue(this.plugin.settings.syncFolder || getDefaultSyncFolder(this.plugin.settings.roomName))
+          .onChange((val) => {
+            if (applyTimeout !== undefined) window.clearTimeout(applyTimeout);
+            applyTimeout = window.setTimeout(async () => {
+              const engine = this.plugin.configSyncEngine;
+              if (engine) await engine.syncConfig(true);
+              const normalized = normalizeSyncFolder(val, this.plugin.settings.roomName);
+              this.plugin.settings.syncFolder = normalized;
+              if (engine) engine.syncFolder = normalized;
+              await this.plugin.saveSettings();
+              this.plugin.reconnectAll();
+            }, 750);
+          });
+      });
 
     new Setting(containerEl)
       .setName('Server Connection URL')
       .setDesc('The WebSocket server all your devices connect to. Default: ws://localhost:4444 (local server on this PC).')
-      .addText(text => text
-        .setPlaceholder('ws://localhost:4444')
-        .setValue(this.plugin.settings.signalingUrl)
-        .onChange(async (val) => {
-          this.plugin.settings.signalingUrl = val;
-          if (this.plugin.configSyncEngine) {
-            this.plugin.configSyncEngine.serverUrl = val || 'ws://localhost:4444';
-          }
-          await this.plugin.saveSettings();
-        }));
+      .addText(text => {
+        let applyTimeout: number | undefined;
+        return text
+          .setPlaceholder('ws://localhost:4444')
+          .setValue(this.plugin.settings.signalingUrl)
+          .onChange((val) => {
+            if (applyTimeout !== undefined) window.clearTimeout(applyTimeout);
+            applyTimeout = window.setTimeout(async () => {
+              const engine = this.plugin.configSyncEngine;
+              if (engine) await engine.syncConfig(true);
+              this.plugin.settings.signalingUrl = val;
+              if (engine) engine.serverUrl = val || 'ws://localhost:4444';
+              await this.plugin.saveSettings();
+              this.plugin.reconnectAll();
+            }, 750);
+          });
+      });
 
     new Setting(containerEl)
       .setName('Shared Secret')
       .setDesc('Required by the server. Copy the same generated value to every device. Restart the local server after changing it.')
       .addText(text => {
+        let applyTimeout: number | undefined;
         text.inputEl.type = 'password';
         return text
           .setPlaceholder('Generated automatically')
           .setValue(this.plugin.settings.sharedSecret)
-          .onChange(async (val) => {
-            this.plugin.settings.sharedSecret = val.trim();
-            if (this.plugin.configSyncEngine) this.plugin.configSyncEngine.pass = val.trim();
-            await this.plugin.saveSettings();
+          .onChange((val) => {
+            if (applyTimeout !== undefined) window.clearTimeout(applyTimeout);
+            applyTimeout = window.setTimeout(async () => {
+              const engine = this.plugin.configSyncEngine;
+              if (engine) await engine.syncConfig(true);
+              this.plugin.settings.sharedSecret = val.trim();
+              if (engine) engine.pass = val.trim();
+              await this.plugin.saveSettings();
+            }, 750);
           });
       })
       .addButton(button => button
@@ -1028,14 +1043,14 @@ class LaplasCoworkSettingTab extends PluginSettingTab {
           new Notice('Reconnecting to server...');
         }));
 
-    // ── Section: Full Vault Sync ──
-    containerEl.createEl('h3', { text: '📂 Full Vault Sync', attr: { style: sectionHeaderStyle() } });
+    // ── Section: Isolated Room Sync ──
+    containerEl.createEl('h3', { text: '📂 Isolated Room Sync', attr: { style: sectionHeaderStyle() } });
     
     new Setting(containerEl)
-      .setName('Sync Entire Vault Configurations')
-      .setDesc('Synchronize vault files and safe configuration files. Installed plugin code and device-specific workspace state are excluded.')
+      .setName('Sync Room Folder')
+      .setDesc(`Synchronize only ${this.plugin.configSyncEngine?.folder || getDefaultSyncFolder(this.plugin.settings.roomName)}. The rest of the vault is outside plugin scope.`)
       .addButton(btn => btn
-        .setButtonText('Sync Vault Now')
+        .setButtonText('Sync Folder Now')
         .setCta()
         .onClick(async () => {
           if (!this.plugin.configSyncEngine) {
@@ -1045,20 +1060,15 @@ class LaplasCoworkSettingTab extends PluginSettingTab {
           await this.plugin.configSyncEngine.syncConfig(false);
         }));
 
-    // ── Section: Advanced Database Tools ──
-    containerEl.createEl('h3', { text: '🛠️ Advanced Database Tools', attr: { style: sectionHeaderStyle() } });
-
     new Setting(containerEl)
-      .setName('Reconstruct Server Database')
-      .setDesc('Purges the server room-state binaries and reconstructs the server database using your current local notes as the source of truth. Use this to instantly resolve any persistent synchronization issues or phantom conflict files.')
+      .setName('Publish Existing Local Files')
+      .setDesc('First connection is pull-first. Use this explicitly to upload files that already existed in the room folder before Laplas Cowork connected.')
       .addButton(btn => btn
-        .setButtonText('⚠️ Reconstruct Database')
+        .setButtonText('Publish Local Files')
         .setWarning()
         .onClick(async () => {
-          const confirmReset = confirm('⚠️ Are you sure you want to reconstruct the server database?\n\nThis will purge all server-side document history binaries and recreate them from your current local files. Other connected devices will temporarily disconnect and automatically resync.');
-          if (confirmReset) {
-            await this.plugin.reconstructDatabase();
-          }
+          const confirmPublish = confirm('Publish previously existing files from the isolated room folder?\n\nFiles are created only when the path does not already exist on the server. Server versions always win conflicts.');
+          if (confirmPublish) await this.plugin.configSyncEngine?.publishLocalFiles();
         }));
   }
 }

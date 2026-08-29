@@ -1,9 +1,9 @@
 {
   "id": "laplas-cowork",
   "name": "Laplas Cowork",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Self-hosted real-time collaboration and vault synchronization.",
+  "description": "Self-hosted collaboration inside an isolated room folder.",
   "author": "yazmeyaa",
   "authorUrl": "https://github.com/yazmeyaa",
   "isDesktopOnly": false

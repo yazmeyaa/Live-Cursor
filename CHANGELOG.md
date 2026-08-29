@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.1.0] - 2026-08-29
+
+### Changed
+- Restricted all file and live-document synchronization to one configurable room folder, defaulting to `<room-name>[laplas_cowork]`.
+- Made first connection pull-first; pre-existing local files require explicit publication.
+- Made the server authoritative with revision-checked uploads and deletes.
+
+### Fixed
+- Prevented simultaneous clients from seeding an empty Yjs room and duplicating the entire note.
+- Removed collision-prone legacy room lookup based on truncated file paths.
+- Prevented stale clients from implicitly resurrecting server tombstones.
+
 ## [2.0.1] - 2026-08-28
 
 ### Fixed
