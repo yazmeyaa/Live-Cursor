@@ -185,7 +185,10 @@ export default class LaplasCoworkPlugin extends Plugin {
       })
     );
     this.registerEvent(this.app.vault.on('create', (file) => {
-      if (file instanceof TFile && this.isManagedPath(file.path)) backgroundSyncDebouncer();
+      if (file instanceof TFile && this.isManagedPath(file.path)) {
+        this.configSyncEngine?.markLocalCreation(file.path);
+        backgroundSyncDebouncer();
+      }
     }));
     this.registerEvent(this.app.vault.on('delete', (file) => {
       if (file instanceof TFile) {

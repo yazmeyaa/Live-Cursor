@@ -1,7 +1,4 @@
-# Release Notes — Version 2.1.0
+# Release Notes — Version 2.1.1
 
-- Laplas Cowork now works only inside a configurable isolated room folder.
-- New devices pull server state first; existing local files are published only after explicit confirmation.
-- Server revisions reject stale uploads, deletes, and tombstone resurrection.
-- Server-owned Yjs bootstrap prevents duplicate full-document insertion.
-- Legacy truncated room lookup was removed to prevent cross-document state collisions.
+- Fixed newly created files being immediately removed when their path had an existing server tombstone.
+- Files created during the current session now safely recreate that exact tombstone revision without allowing stale devices to resurrect deleted data.

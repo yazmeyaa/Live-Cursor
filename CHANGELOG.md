@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.1.1] - 2026-08-29
+
+### Fixed
+- Allowed a file explicitly created during the current session to safely replace its previous tombstone revision instead of being deleted as stale data.
+
 ## [2.1.0] - 2026-08-29
 
 ### Changed

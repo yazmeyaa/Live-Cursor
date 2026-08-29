@@ -90,3 +90,70 @@ test('initial sync scans only the room folder and requires explicit publication'
   assert.deepEqual(uploads, ['note.md']);
   delete globalThis.__laplasRequestUrl;
 });
+
+test('a file created in this session explicitly recreates a server tombstone', async () => {
+  const ConfigSyncEngine = await enginePromise;
+  const encoder = new TextEncoder();
+  const fileData = encoder.encode('new document');
+  let uploaded = false;
+  globalThis.__laplasRequestUrl = async options => {
+    if (options.method === 'GET' && options.url.includes('/manifest')) {
+      return {
+        status: 200,
+        text: '',
+        json: {
+          'Untitled.md': {
+            size: 0,
+            mtime: 1,
+            hash: 'deleted-hash',
+            revision: 4,
+            deleted: true
+          }
+        }
+      };
+    }
+    if (options.method === 'POST' && options.url.includes('/upload')) {
+      const params = new URL(options.url).searchParams;
+      assert.equal(params.get('path'), 'Untitled.md');
+      assert.equal(params.get('baseRevision'), '4');
+      uploaded = true;
+      return { status: 200, json: { hash: 'new-hash', revision: 5 }, text: '' };
+    }
+    throw new Error(`Unexpected request: ${options.method} ${options.url}`);
+  };
+
+  const storedText = new Map();
+  const adapter = {
+    async mkdir() {},
+    async exists(filePath) { return storedText.has(filePath); },
+    async read(filePath) { return storedText.get(filePath); },
+    async write(filePath, value) { storedText.set(filePath, value); },
+    async list(dir) {
+      assert.equal(dir, 'team[laplas_cowork]');
+      return { files: ['team[laplas_cowork]/Untitled.md'], folders: [] };
+    },
+    async stat() { return { mtime: 2, size: fileData.byteLength }; },
+    async readBinary() {
+      return fileData.buffer.slice(fileData.byteOffset, fileData.byteOffset + fileData.byteLength);
+    },
+    async remove() { throw new Error('newly created file must not be removed'); }
+  };
+  const app = { vault: { adapter, getAbstractFileByPath: () => null } };
+  const engine = new ConfigSyncEngine(
+    app,
+    'ws://localhost:4444',
+    'device',
+    'secret',
+    'team',
+    'device',
+    '',
+    () => false,
+    '.plugin-data'
+  );
+
+  engine.markLocalCreation('team[laplas_cowork]/Untitled.md');
+  assert.equal(await engine.syncConfig(true), true);
+  assert.equal(uploaded, true);
+  assert.equal(await engine.canCollaborate('team[laplas_cowork]/Untitled.md'), true);
+  delete globalThis.__laplasRequestUrl;
+});

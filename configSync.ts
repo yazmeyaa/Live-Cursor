@@ -50,6 +50,7 @@ export class ConfigSyncEngine {
   private syncStateSavePromise: Promise<void> = Promise.resolve();
   private syncState: StoredSyncState = { version: 2, scopes: {} };
   private syncStateDirty = false;
+  private localCreations = new Set<string>();
 
   constructor(
     private app: App,
@@ -73,6 +74,11 @@ export class ConfigSyncEngine {
 
   public getLocalPath(remotePath: string): string {
     return getLocalPath(remotePath, this.folder);
+  }
+
+  public markLocalCreation(localPath: string): void {
+    const relativePath = this.getRemotePath(localPath);
+    if (relativePath && !shouldIgnoreRemotePath(relativePath)) this.localCreations.add(relativePath);
   }
 
   private getQuery(relativePath?: string): string {
@@ -317,6 +323,18 @@ export class ConfigSyncEngine {
           if (local) {
             const localData = await this.app.vault.adapter.readBinary(local.localPath);
             const localHash = await this.hashData(localData);
+            if (this.localCreations.has(relativePath)) {
+              const recreated = await this.uploadFile(relativePath, localData, local.stat.mtime, remote.revision);
+              if (recreated) {
+                this.localCreations.delete(relativePath);
+                delete scope.unpublished[relativePath];
+                this.setFileState(relativePath, recreated);
+                actionsCount++;
+              } else {
+                this.syncPending = true;
+              }
+              continue;
+            }
             if (localHash !== remote.hash) await this.preserveConflict(relativePath, localData, this.deviceName);
             await this.removeLocalFile(local.localPath);
             actionsCount++;
@@ -333,13 +351,16 @@ export class ConfigSyncEngine {
         if (local && !remote) {
           const data = await this.app.vault.adapter.readBinary(local.localPath);
           const localHash = await this.hashData(data);
-          if (firstSync || scope.unpublished[relativePath]) {
+          const createdNow = this.localCreations.has(relativePath);
+          if (!createdNow && (firstSync || scope.unpublished[relativePath])) {
             scope.unpublished[relativePath] = localHash;
             this.syncStateDirty = true;
             continue;
           }
           const uploaded = await this.uploadFile(relativePath, data, local.stat.mtime, 0);
           if (uploaded) {
+            this.localCreations.delete(relativePath);
+            delete scope.unpublished[relativePath];
             this.setFileState(relativePath, uploaded);
             actionsCount++;
           } else {
@@ -352,6 +373,7 @@ export class ConfigSyncEngine {
           const data = await this.downloadFile(relativePath);
           await this.writeLocal(relativePath, data);
           delete scope.unpublished[relativePath];
+          this.localCreations.delete(relativePath);
           this.setFileState(relativePath, {
             hash: remote.hash ?? await this.hashData(data),
             revision: remote.revision,
@@ -366,6 +388,7 @@ export class ConfigSyncEngine {
         const remoteHash = remote.hash ?? '';
         if (localHash === remoteHash) {
           delete scope.unpublished[relativePath];
+          this.localCreations.delete(relativePath);
           this.setFileState(relativePath, { hash: remoteHash, revision: remote.revision });
           continue;
         }
