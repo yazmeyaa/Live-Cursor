@@ -81,6 +81,11 @@ export class ConfigSyncEngine {
     if (relativePath && !shouldIgnoreRemotePath(relativePath)) this.localCreations.add(relativePath);
   }
 
+  public async renameLocalFile(oldLocalPath: string, newLocalPath: string): Promise<void> {
+    this.markLocalCreation(newLocalPath);
+    await this.deleteRemoteFile(oldLocalPath);
+  }
+
   private getQuery(relativePath?: string): string {
     const values = [
       `user=${encodeQueryValue(this.user)}`,

@@ -1,4 +1,5 @@
-# Release Notes — Version 2.1.1
+# Release Notes — Version 2.1.2
 
-- Fixed newly created files being immediately removed when their path had an existing server tombstone.
-- Files created during the current session now safely recreate that exact tombstone revision without allowing stale devices to resurrect deleted data.
+- Fixed renamed files disappearing on other participants' devices.
+- Renamed files now safely replace a previous tombstone at the destination path.
+- Folder renames now synchronize every file inside the renamed folder.

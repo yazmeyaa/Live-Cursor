@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.1.2] - 2026-09-03
+
+### Fixed
+- Preserved renamed files on other clients by publishing the new path before deleting the old one.
+- Applied file rename synchronization recursively when a folder is renamed.
+
 ## [2.1.1] - 2026-08-29
 
 ### Fixed

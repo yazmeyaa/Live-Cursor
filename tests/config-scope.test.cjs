@@ -157,3 +157,27 @@ test('a file created in this session explicitly recreates a server tombstone', a
   assert.equal(await engine.canCollaborate('team[laplas_cowork]/Untitled.md'), true);
   delete globalThis.__laplasRequestUrl;
 });
+
+test('rename marks the full destination path before deleting the source', async () => {
+  const ConfigSyncEngine = await enginePromise;
+  const engine = new ConfigSyncEngine(
+    { vault: { adapter: {} } },
+    'ws://localhost:4444',
+    'device',
+    'secret',
+    'team'
+  );
+  const calls = [];
+  engine.markLocalCreation = localPath => calls.push(['create', localPath]);
+  engine.deleteRemoteFile = async localPath => calls.push(['delete', localPath]);
+
+  await engine.renameLocalFile(
+    'team[laplas_cowork]/Andrey/Draft.md',
+    'team[laplas_cowork]/Andrey/Linear algebra.md'
+  );
+
+  assert.deepEqual(calls, [
+    ['create', 'team[laplas_cowork]/Andrey/Linear algebra.md'],
+    ['delete', 'team[laplas_cowork]/Andrey/Draft.md']
+  ]);
+});

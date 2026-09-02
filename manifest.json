@@ -1,7 +1,7 @@
 {
   "id": "laplas-cowork",
   "name": "Laplas Cowork",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "minAppVersion": "1.5.0",
   "description": "Self-hosted collaboration inside an isolated room folder.",
   "author": "yazmeyaa",

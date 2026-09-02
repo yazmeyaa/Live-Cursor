@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, MarkdownView, Notice, Platform, debounce } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, TFolder, Vault, WorkspaceLeaf, MarkdownView, Notice, Platform, debounce } from 'obsidian';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
@@ -205,17 +205,37 @@ export default class LaplasCoworkPlugin extends Plugin {
       if (file instanceof TFile && this.isManagedPath(file.path)) backgroundSyncDebouncer();
     }));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-      const sync = this.activeSyncs.get(oldPath);
-      if (sync) {
-        this.detachEditorForFile(oldPath);
-        sync.provider.destroy();
-        sync.doc.destroy();
-        this.activeSyncs.delete(oldPath);
-        this.diskDebouncers.delete(oldPath);
+      const renamedFiles = file instanceof TFile ? [file] : [];
+      if (file instanceof TFolder) {
+        Vault.recurseChildren(file, child => {
+          if (child instanceof TFile) renamedFiles.push(child);
+        });
       }
-      void this.configSyncEngine?.deleteRemoteFile(oldPath);
-      if (file instanceof TFile && this.isManagedPath(file.path)) void this.syncFile(file);
-      if (this.isManagedPath(oldPath) || (file instanceof TFile && this.isManagedPath(file.path))) backgroundSyncDebouncer();
+
+      const activeRenamedFiles: TFile[] = [];
+      let touchesManagedPath = false;
+      const renames = renamedFiles.map(renamedFile => {
+        const renamedOldPath = oldPath + renamedFile.path.slice(file.path.length);
+        touchesManagedPath ||= this.isManagedPath(renamedOldPath) || this.isManagedPath(renamedFile.path);
+        const sync = this.activeSyncs.get(renamedOldPath);
+        if (sync) {
+          this.detachEditorForFile(renamedFile.path);
+          sync.provider.destroy();
+          sync.doc.destroy();
+          this.activeSyncs.delete(renamedOldPath);
+          this.diskDebouncers.delete(renamedOldPath);
+          activeRenamedFiles.push(renamedFile);
+        }
+        return this.configSyncEngine?.renameLocalFile(renamedOldPath, renamedFile.path);
+      });
+
+      void Promise.all(renames).then(() => {
+        if (file instanceof TFile && this.isManagedPath(file.path)) void this.syncFile(file);
+        else for (const renamedFile of activeRenamedFiles) {
+          if (this.isManagedPath(renamedFile.path)) void this.syncFile(renamedFile);
+        }
+        if (touchesManagedPath) backgroundSyncDebouncer();
+      });
     }));
 
     // Automatically check for remote vault changes every 30 seconds
